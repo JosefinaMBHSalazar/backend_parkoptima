@@ -187,6 +187,8 @@ def update_settings(payload: SystemSettingsBase, db: Session = Depends(get_db)):
     settings.system_name = payload.system_name
     settings.motor_fee = payload.motor_fee
     settings.four_wheel_fee = payload.four_wheel_fee
+    settings.total_motor_slots = payload.total_motor_slots
+    settings.total_four_wheel_slots = payload.total_four_wheel_slots
     db.commit()
     db.refresh(settings)
     return settings
@@ -900,6 +902,11 @@ def api_delete_user(user_id: int, db: Session = Depends(get_db)):
 
 
 # â”€â”€ Owner profile & settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/api/owner/profile", response_model=OwnerProfileResponse)
+def api_get_owner_profile(db: Session = Depends(get_db)):
+    return get_owner_profile(db)
+
+
 @app.put("/api/owner/profile", response_model=OwnerProfileResponse)
 def api_update_owner_profile(payload: OwnerProfileUpdate, db: Session = Depends(get_db)):
     return update_owner_profile(payload, db)
