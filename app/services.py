@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 from sqlalchemy.orm import Session
 
 from .models import OwnerProfile, ParkingSession, SystemSettings
+from .plate_patterns import classify_plate_type, extract_plate_candidate, normalize_plate_key
 
 _YOLO_MODEL = None
 
@@ -60,12 +61,10 @@ def get_or_create_owner_profile(db: Session) -> OwnerProfile:
 
 
 def infer_vehicle_type(plate_number: str) -> str:
-    cleaned = plate_number.replace("-", "").upper()
-    if not cleaned:
-        return "motor"
-    if cleaned[0].isdigit():
-        return "4_wheels"
-    return "motor"
+    vehicle_type = classify_plate_type(plate_number)
+    if vehicle_type is None:
+        raise ValueError("The scan does not contain a recognized vehicle plate")
+    return vehicle_type
 
 
 def estimate_fee(vehicle_type: str, settings: SystemSettings) -> float:
@@ -73,29 +72,25 @@ def estimate_fee(vehicle_type: str, settings: SystemSettings) -> float:
 
 
 def analyze_scan_image(image_base64: str) -> Tuple[str, float, str]:
-    try:
-        import cv2
-        import easyocr
-        import numpy as np
-    except Exception:
-        return "ABC123", 0.82, "motor"
+    import cv2
+    import easyocr
+    import numpy as np
 
-    try:
-        image_bytes = base64.b64decode(image_base64)
-        image_stream = io.BytesIO(image_bytes)
-        image_array = np.asarray(bytearray(image_stream.read()), dtype=np.uint8)
-        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("invalid image")
+    image_bytes = base64.b64decode(image_base64.split(",", 1)[-1])
+    image_array = np.asarray(bytearray(io.BytesIO(image_bytes).read()), dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Invalid image")
 
-        vehicle_type = _detect_vehicle_type_with_yolo(image)
+    reader = easyocr.Reader(["en"], gpu=False)
+    raw_results = reader.readtext(image, detail=1, paragraph=False)
+    ocr_results = [{"text": result[1], "confidence": float(result[2])} for result in raw_results]
+    plate = extract_plate_candidate(ocr_results)
+    if plate is None:
+        raise ValueError("No recognized vehicle plate found in the image")
 
-        reader = easyocr.Reader(["en"], gpu=False)
-        results = reader.readtext(image, detail=0, paragraph=False)
-        plate = results[0].upper() if results else "ABC123"
-        return plate, 0.91, vehicle_type or infer_vehicle_type(plate)
-    except Exception:
-        return "ABC123", 0.82, "motor"
+    confidence = next((item["confidence"] for item in ocr_results if normalize_plate_key(item["text"]) == plate), 0.0)
+    return plate, confidence, infer_vehicle_type(plate)
 
 
 def create_session_from_scan(db: Session, plate_number: str, vehicle_type: str, settings: SystemSettings) -> ParkingSession:

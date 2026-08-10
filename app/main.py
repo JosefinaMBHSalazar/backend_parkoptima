@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import List, Optional
 
 from passlib.hash import bcrypt
@@ -138,6 +138,8 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session.status == "completed":
+        raise HTTPException(status_code=409, detail="Completed transactions cannot be edited")
     session.payment_method = payload.method
     session.status = "completed"
     db.add(session)
