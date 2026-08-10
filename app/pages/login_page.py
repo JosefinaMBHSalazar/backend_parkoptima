@@ -1,6 +1,6 @@
-from typing import Dict
+﻿from typing import Dict
 from sqlalchemy.orm import Session
-from .models import OwnerProfile
+from ..models import OwnerProfile
 
 
 def get_login_page_data(db: Session) -> Dict[str, object]:
@@ -9,3 +9,4 @@ def get_login_page_data(db: Session) -> Dict[str, object]:
         "default_email": profile.email if profile else "owner@parkoptima.com",
         "default_role": "owner",
     }
+

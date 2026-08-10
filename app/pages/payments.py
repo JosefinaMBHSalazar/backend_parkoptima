@@ -1,9 +1,11 @@
-from typing import List, Dict
+﻿from typing import List, Dict
+
 from sqlalchemy.orm import Session
-from .models import ParkingSession
+
+from ..models import ParkingSession, PaymentTransaction
 
 
-def get_transaction_log_data(db: Session) -> List[Dict[str, object]]:
+def get_payments(db: Session) -> List[Dict[str, object]]:
     sessions = db.query(ParkingSession).order_by(ParkingSession.entry_time.desc()).all()
     return [
         {
@@ -17,3 +19,4 @@ def get_transaction_log_data(db: Session) -> List[Dict[str, object]]:
         }
         for session in sessions
     ]
+

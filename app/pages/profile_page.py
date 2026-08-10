@@ -1,6 +1,6 @@
-from typing import Dict
+﻿from typing import Dict
 from sqlalchemy.orm import Session
-from .models import OwnerProfile
+from ..models import OwnerProfile
 
 
 def get_profile_page_data(db: Session) -> Dict[str, object]:
@@ -10,3 +10,4 @@ def get_profile_page_data(db: Session) -> Dict[str, object]:
         "email": profile.email if profile else "owner@parkoptima.com",
         "image_url": profile.image_url if profile else None,
     }
+

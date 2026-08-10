@@ -1,6 +1,6 @@
-from typing import Dict, List
+﻿from typing import Dict, List
 from sqlalchemy.orm import Session
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_audit_trail_data(db: Session) -> List[Dict[str, object]]:
@@ -16,3 +16,4 @@ def get_audit_trail_data(db: Session) -> List[Dict[str, object]]:
         }
         for session in sessions
     ]
+

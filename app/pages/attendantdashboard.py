@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -9,7 +9,7 @@ else:
     except ImportError:
         Session = None
 
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_attendant_dashboard_data(db: Session) -> Dict[str, object]:
@@ -34,3 +34,4 @@ def get_attendant_dashboard_data(db: Session) -> Dict[str, object]:
         "revenue_today": revenue_today,
         "generated_at": datetime.utcnow().isoformat(),
     }
+

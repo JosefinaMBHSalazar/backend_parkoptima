@@ -1,8 +1,8 @@
-from typing import Dict
+﻿from typing import Dict
 
 from sqlalchemy.orm import Session
 
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_vehicle_owner_dashboard_data(db: Session) -> Dict[str, object]:
@@ -23,3 +23,4 @@ def get_vehicle_owner_dashboard_data(db: Session) -> Dict[str, object]:
         "fee": float(session.fee or 0.0),
         "payment_method": session.payment_method,
     }
+

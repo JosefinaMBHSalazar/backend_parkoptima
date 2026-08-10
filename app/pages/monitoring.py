@@ -1,8 +1,8 @@
-from typing import Dict, List
+﻿from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_live_monitor_data(db: Session) -> Dict[str, object]:
@@ -22,3 +22,4 @@ def get_live_monitor_data(db: Session) -> Dict[str, object]:
         ],
         "active_sessions": sum(1 for session in sessions if session.status == "parked"),
     }
+

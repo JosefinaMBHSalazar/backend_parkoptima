@@ -1,6 +1,6 @@
-from typing import Dict
+﻿from typing import Dict
 from sqlalchemy.orm import Session
-from .models import SystemSettings
+from ..models import SystemSettings
 
 
 def get_system_settings_data(db: Session) -> Dict[str, object]:
@@ -10,3 +10,4 @@ def get_system_settings_data(db: Session) -> Dict[str, object]:
         "motor_fee": float(settings.motor_fee if settings else 5.0),
         "four_wheel_fee": float(settings.four_wheel_fee if settings else 20.0),
     }
+

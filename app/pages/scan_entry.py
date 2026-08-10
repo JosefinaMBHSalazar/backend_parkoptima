@@ -1,9 +1,9 @@
-from typing import Dict
+﻿from typing import Dict
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
-from .models import ParkingSession
-from .services import analyze_scan_image, create_session_from_scan, get_or_create_settings
+from ..models import ParkingSession
+from ..services import analyze_scan_image, create_session_from_scan, get_or_create_settings
 
 
 def process_scan_entry(db: Session, image_base64: str) -> Dict[str, object]:
@@ -31,3 +31,4 @@ def get_scan_entry_data(db: Session, image_base64: str | None = None) -> Dict[st
             "vehicle_type": session.vehicle_type if session else None,
         }
     return process_scan_entry(db, image_base64)
+

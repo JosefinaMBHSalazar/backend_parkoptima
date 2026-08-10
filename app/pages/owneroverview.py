@@ -1,9 +1,9 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import Dict
 
 from sqlalchemy.orm import Session
 
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_owner_overview_data(db: Session) -> Dict[str, object]:
@@ -19,3 +19,4 @@ def get_owner_overview_data(db: Session) -> Dict[str, object]:
         "revenue": revenue,
         "generated_at": datetime.utcnow().isoformat(),
     }
+

@@ -1,9 +1,9 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
-from .models import ParkingSession
+from ..models import ParkingSession
 
 
 def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
@@ -34,3 +34,4 @@ def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
             for session in sessions
         ],
     }
+

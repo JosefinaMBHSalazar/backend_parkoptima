@@ -1,4 +1,4 @@
-from typing import List, Dict
+﻿from typing import List, Dict
 
 
 def get_quick_actions_data() -> List[Dict[str, object]]:
@@ -7,3 +7,4 @@ def get_quick_actions_data() -> List[Dict[str, object]]:
         {"name": "Parking History", "path": "/vehicle-owner/history"},
         {"name": "Change PIN", "path": "/vehicle-owner/change-pin"},
     ]
+

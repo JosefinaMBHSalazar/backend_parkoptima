@@ -3,8 +3,8 @@ uvicorn==0.24.0
 sqlalchemy==2.0.23
 pymysql==1.1.0
 bcrypt==4.1.0
-passlib==1.7.4
 pyjwt==2.8.0
 python-multipart==0.0.6
 pydantic==2.5.0
 ultralytics
+easyocr
