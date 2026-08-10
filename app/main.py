@@ -1,4 +1,5 @@
 ﻿from datetime import datetime, timezone
+import re
 from typing import List, Optional
 
 import bcrypt
@@ -100,6 +101,13 @@ logger = logging.getLogger(__name__)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ParkOptima Owner Backend", version="1.0.0")
+
+
+def validate_signup_credentials(password: str, contact: Optional[str] = None) -> None:
+    if not re.fullmatch(r"(?=.{6,}$)(?=.*\d)(?=.*[^A-Za-z0-9]).*", password):
+        raise HTTPException(status_code=422, detail="Password must have at least 6 characters, 1 number, and 1 special character")
+    if contact is not None and not re.fullmatch(r"\d{10,11}", contact):
+        raise HTTPException(status_code=422, detail="Contact number must be 10-11 digits")
 
 # Allow the Vite dev server (and other local frontends) to call the API.
 app.add_middleware(
@@ -522,6 +530,7 @@ def signup_form():
 
 @app.post("/register")
 def register_user(payload: UserCreate, db: Session = Depends(get_db)) -> UserResponse:
+    validate_signup_credentials(payload.password, payload.contact)
     existing = db.query(User).filter(User.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -562,6 +571,7 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)) -> UserRes
 
 @app.post("/signup")
 def signup_user(payload: UserCreate, db: Session = Depends(get_db)) -> UserResponse:
+    validate_signup_credentials(payload.password, payload.contact)
     existing = db.query(User).filter(User.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -838,6 +848,7 @@ def api_get_users(db: Session = Depends(get_db)):
 
 @app.post("/api/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def api_create_user(payload: UserCreate, db: Session = Depends(get_db)):
+    validate_signup_credentials(payload.password, payload.contact)
     existing = db.query(User).filter(User.email == payload.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
