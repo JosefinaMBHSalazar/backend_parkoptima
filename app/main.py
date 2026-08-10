@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import bcrypt
 import pytz
-from fastapi import Depends, FastAPI, HTTPException, status 
+from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session 
 
@@ -54,7 +54,8 @@ from .schemas import (
     PasswordVerifyResponse,
 )
 from .services import analyze_scan_image, get_or_create_owner_profile, get_or_create_settings
-from .analytics_engine import build_forecast, build_natural_language_summary, recommend_slot
+from .analytics_engine import build_natural_language_summary, recommend_slot
+import asyncio
 from .auth import authenticate_vehicle_owner, authenticate_user, _verify_password
 from .pages.ownerdashboard import get_owner_dashboard_data
 from .pages.owneroverview import get_owner_overview_data
@@ -101,6 +102,51 @@ logger = logging.getLogger(__name__)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ParkOptima Owner Backend", version="1.0.0")
+
+
+# Simple WebSocket connection manager for broadcasting events
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            pass
+
+    async def send_personal_message(self, message: dict, websocket: WebSocket):
+        await websocket.send_json(message)
+
+    async def broadcast(self, message: dict):
+        to_remove = []
+        for conn in list(self.active_connections):
+            try:
+                await conn.send_json(message)
+            except Exception:
+                to_remove.append(conn)
+        for r in to_remove:
+            self.disconnect(r)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Echo/ping support: client may send ping messages with timestamp
+            data = await websocket.receive_json()
+            if isinstance(data, dict) and data.get('type') == 'ping' and 'ts' in data:
+                await manager.send_personal_message({'type': 'pong', 'ts': data['ts'], 'server_ts': datetime.utcnow().isoformat()}, websocket)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 def validate_signup_credentials(password: str, contact: Optional[str] = None) -> None:
@@ -203,6 +249,32 @@ def list_sessions(db: Session = Depends(get_db)):
 @app.post("/owner/sessions", response_model=ParkingSessionResponse, status_code=status.HTTP_201_CREATED)
 def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
     settings = get_or_create_settings(db)
+    # Duplicate/open-session check: prevent creating a new entry if the same plate is already parked
+    existing = db.query(ParkingSession).filter(
+        ParkingSession.plate_number == payload.plate_number.upper(),
+        ParkingSession.status == 'parked'
+    ).first()
+    if existing:
+        # Log the duplicate attempt and broadcast audit
+        try:
+            entry = create_audit_log(db, user_id=None, user_email=None, user_role='attendant', action_type='duplicate_entry_attempt', reference_id=str(existing.id), details=f"Attempt to create duplicate session for plate {payload.plate_number}")
+            try:
+                asyncio.create_task(manager.broadcast({'type': 'audit', 'audit': {
+                    'id': entry.id,
+                    'user_id': entry.user_id,
+                    'user_email': entry.user_email,
+                    'user_role': entry.user_role,
+                    'action_type': entry.action_type,
+                    'reference_id': entry.reference_id,
+                    'details': entry.details,
+                    'timestamp': entry.timestamp.isoformat() if entry.timestamp is not None else None,
+                }}))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail=f"Active session already exists for plate {payload.plate_number}")
+
     session = ParkingSession(
         plate_number=payload.plate_number.upper(),
         vehicle_type=payload.vehicle_type,
@@ -216,6 +288,21 @@ def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
     db.add(session)
     db.commit()
     db.refresh(session)
+    # Broadcast session creation to connected WS clients
+    try:
+        asyncio.create_task(manager.broadcast({
+            'type': 'session_created',
+            'session': {
+                'id': session.id,
+                'plate_number': session.plate_number,
+                'slot': session.slot,
+                'status': session.status,
+                'entry_time': session.entry_time.isoformat() if session.entry_time is not None else None,
+                'vehicle_type': session.vehicle_type,
+            }
+        }))
+    except Exception:
+        pass
     return session
 
 
@@ -240,6 +327,52 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    # Validate fee matches current system settings to avoid wrong charge
+    settings = get_or_create_settings(db)
+    expected_fee = settings.motor_fee if session.vehicle_type == "motor" else settings.four_wheel_fee
+    if abs((session.fee or 0) - (expected_fee or 0)) > 0.01:
+        # Log mismatch and broadcast audit
+        try:
+            entry = create_audit_log(db, user_id=None, user_email=None, user_role='attendant', action_type='payment_fee_mismatch', reference_id=str(session.id), details=f"Session fee {session.fee} does not match expected {expected_fee}")
+            try:
+                asyncio.create_task(manager.broadcast({'type': 'audit', 'audit': {
+                    'id': entry.id,
+                    'user_id': entry.user_id,
+                    'user_email': entry.user_email,
+                    'user_role': entry.user_role,
+                    'action_type': entry.action_type,
+                    'reference_id': entry.reference_id,
+                    'details': entry.details,
+                    'timestamp': entry.timestamp.isoformat() if entry.timestamp is not None else None,
+                }}))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail="Session fee does not match current system settings")
+
+    # Prevent duplicate payment transactions (same session + method)
+    existing_tx = db.query(PaymentTransaction).filter(PaymentTransaction.session_id == session.id, PaymentTransaction.method == payload.method).first()
+    if existing_tx:
+        try:
+            entry = create_audit_log(db, user_id=None, user_email=None, user_role='attendant', action_type='duplicate_payment_attempt', reference_id=str(session.id), details=f"Duplicate payment attempt: method={payload.method}")
+            try:
+                asyncio.create_task(manager.broadcast({'type': 'audit', 'audit': {
+                    'id': entry.id,
+                    'user_id': entry.user_id,
+                    'user_email': entry.user_email,
+                    'user_role': entry.user_role,
+                    'action_type': entry.action_type,
+                    'reference_id': entry.reference_id,
+                    'details': entry.details,
+                    'timestamp': entry.timestamp.isoformat() if entry.timestamp is not None else None,
+                }}))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail="Payment for this session using the same method already exists")
+
     session.payment_method = payload.method
     # Don't change status here - let the exit process handle it
     db.add(session)
@@ -249,6 +382,26 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
     transaction = PaymentTransaction(session_id=session.id, amount=session.fee, method=payload.method)
     db.add(transaction)
     db.commit()
+    # Broadcast session update with payment transaction
+    try:
+        asyncio.create_task(manager.broadcast({
+            'type': 'session_updated',
+            'session': {
+                'id': session.id,
+                'plate_number': session.plate_number,
+                'slot': session.slot,
+                'status': session.status,
+                'payment_method': session.payment_method,
+            },
+            'transaction': {
+                'id': transaction.id,
+                'amount': transaction.amount,
+                'method': transaction.method,
+                'created_at': transaction.created_at.isoformat() if hasattr(transaction, 'created_at') and transaction.created_at is not None else None,
+            }
+        }))
+    except Exception:
+        pass
     return session
 
 
@@ -729,12 +882,6 @@ def api_recommend_slot(vehicle_type: str = "motor", db: Session = Depends(get_db
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-
-@app.get("/api/analytics/forecast")
-def api_forecast(horizon_hours: int = 6, db: Session = Depends(get_db)):
-    if horizon_hours < 1 or horizon_hours > 24:
-        raise HTTPException(status_code=400, detail="horizon_hours must be between 1 and 24")
-    return build_forecast(db, horizon_hours)
 
 
 @app.get("/api/analytics/summary")

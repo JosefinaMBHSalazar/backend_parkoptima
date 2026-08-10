@@ -58,46 +58,7 @@ def _hourly_values(sessions: Iterable[ParkingSession], days: int = 14) -> Dict[d
     return values or all_values
 
 
-def build_forecast(db: Session, horizon_hours: int = 6) -> Dict[str, Any]:
-    sessions = db.query(ParkingSession).all()
-    history = _hourly_values(sessions)
-    by_hour: Dict[int, Dict[str, List[float]]] = defaultdict(lambda: {"occupancy": [], "revenue": []})
-    for timestamp, value in history.items():
-        by_hour[timestamp.hour]["occupancy"].append(value["occupancy"])
-        by_hour[timestamp.hour]["revenue"].append(value["revenue"])
-
-    predictions = []
-    occupancy_errors: List[float] = []
-    revenue_errors: List[float] = []
-    for timestamp, value in history.items():
-        baseline = by_hour[timestamp.hour]
-        if len(baseline["occupancy"]) < 2:
-            continue
-        predicted_occupancy = mean(baseline["occupancy"])
-        predicted_revenue = mean(baseline["revenue"])
-        occupancy_errors.append(value["occupancy"] - predicted_occupancy)
-        revenue_errors.append(value["revenue"] - predicted_revenue)
-
-    now = datetime.now().replace(minute=0, second=0, microsecond=0)
-    for offset in range(1, horizon_hours + 1):
-        timestamp = now + timedelta(hours=offset)
-        baseline = by_hour.get(timestamp.hour, {"occupancy": [], "revenue": []})
-        predictions.append({
-            "timestamp": timestamp.isoformat(),
-            "expected_occupancy": round(mean(baseline["occupancy"]) if baseline["occupancy"] else 0.0, 2),
-            "expected_revenue": round(mean(baseline["revenue"]) if baseline["revenue"] else 0.0, 2),
-        })
-
-    def rmse(errors: List[float]) -> float:
-        return round(sqrt(mean([error * error for error in errors])), 2) if errors else 0.0
-
-    return {
-        "method": "hour_of_day_baseline",
-        "training_window_days": 14 if history and any(timestamp >= datetime.now() - timedelta(days=14) for timestamp in history) else "all_available",
-        "training_samples": len(history),
-        "metrics": {"occupancy_mae": round(mean(abs(error) for error in occupancy_errors), 2) if occupancy_errors else 0.0, "occupancy_rmse": rmse(occupancy_errors), "revenue_mae": round(mean(abs(error) for error in revenue_errors), 2) if revenue_errors else 0.0, "revenue_rmse": rmse(revenue_errors)},
-        "forecast": predictions,
-    }
+# Forecasting feature removed per user request. Historical/summary analytics remain.
 
 
 def build_natural_language_summary(db: Session) -> Dict[str, Any]:

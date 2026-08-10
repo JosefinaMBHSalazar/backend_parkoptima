@@ -366,7 +366,20 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
     try:
         reader = _get_easyocr_reader()
         np_image = np.asarray(image)
-        detections = reader.readtext(np_image, detail=1, paragraph=False)
+        # Preprocessing: CLAHE, denoise and sharpen to improve OCR
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+            gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+            blur = cv2.GaussianBlur(gray, (0,0), sigmaX=3)
+            sharpened = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+            proc_img = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+            logger.debug("OCR preprocessing applied")
+        except Exception as pre_e:
+            logger.warning(f"OCR preprocessing failed: {pre_e}; using original image")
+            proc_img = np_image
+        detections = reader.readtext(proc_img, detail=1, paragraph=False)
         logger.info(f"EasyOCR found {len(detections)} text detections")
         for det in detections:
             text = det[1] if len(det) > 1 else ""
@@ -521,8 +534,15 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
             vehicle_type = infer_vehicle_type(best_plate)
             logger.info(f"Inferred vehicle type from plate: {vehicle_type}")
 
-    logger.info(f"🎯 FINAL RESULT: Plate='{best_plate}', Conf={best_conf}, Type={vehicle_type}")
-    return best_plate, round(best_conf, 2), vehicle_type
+    # Normalize confidence to 0..1 (EasyOCR may return 0..100)
+    try:
+        conf_val = float(best_conf)
+        if conf_val > 1.0:
+            conf_val = conf_val / 100.0
+    except Exception:
+        conf_val = 0.0
+    logger.info(f"🎯 FINAL RESULT: Plate='{best_plate}', Conf={conf_val}, Type={vehicle_type}")
+    return best_plate, round(conf_val, 3), vehicle_type
 
 
 def create_session_from_scan(db: Session, plate_number: str, vehicle_type: str, settings: SystemSettings) -> ParkingSession:
