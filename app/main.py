@@ -760,6 +760,8 @@ def api_update_session(session_id: int, payload: ParkingSessionUpdate, db: Sessi
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session.status == "completed":
+        raise HTTPException(status_code=409, detail="Completed transactions cannot be edited")
 
     if payload.plate_number is not None:
         session.plate_number = payload.plate_number.upper()
@@ -792,6 +794,8 @@ def api_delete_session(session_id: int, db: Session = Depends(get_db)):
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session.status == "completed":
+        raise HTTPException(status_code=409, detail="Completed transactions cannot be deleted")
     db.delete(session)
     db.commit()
 
