@@ -53,6 +53,7 @@ from .schemas import (
     PasswordVerifyResponse,
 )
 from .services import analyze_scan_image, get_or_create_owner_profile, get_or_create_settings
+from .analytics_engine import build_forecast, build_natural_language_summary, recommend_slot
 from .auth import authenticate_vehicle_owner, authenticate_user, _verify_password
 from .pages.ownerdashboard import get_owner_dashboard_data
 from .pages.owneroverview import get_owner_overview_data
@@ -688,13 +689,18 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
     if fee is None or fee == 0:
         fee = settings.motor_fee if vehicle_type == "motor" else settings.four_wheel_fee
     
+    try:
+        slot = recommend_slot(db, vehicle_type, payload.slot)["recommended_slot"]
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     session = ParkingSession(
         plate_number=payload.plate_number.upper(),
         vehicle_type=vehicle_type,
         fee=fee,
         payment_method=payload.payment_method,
         status=payload.status or "parked",
-        slot=payload.slot,
+        slot=slot,
         notes=payload.notes,
         entry_time=datetime.now(pytz.UTC),  # Use timezone-aware UTC
     )
@@ -702,6 +708,26 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
     db.commit()
     db.refresh(session)
     return session
+
+
+@app.get("/api/slots/recommend")
+def api_recommend_slot(vehicle_type: str = "motor", db: Session = Depends(get_db)):
+    try:
+        return recommend_slot(db, _api_normalize_vehicle_type(vehicle_type))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/analytics/forecast")
+def api_forecast(horizon_hours: int = 6, db: Session = Depends(get_db)):
+    if horizon_hours < 1 or horizon_hours > 24:
+        raise HTTPException(status_code=400, detail="horizon_hours must be between 1 and 24")
+    return build_forecast(db, horizon_hours)
+
+
+@app.get("/api/analytics/summary")
+def api_analytics_summary(db: Session = Depends(get_db)):
+    return build_natural_language_summary(db)
 
 
 @app.get("/api/sessions/{session_id}", response_model=ParkingSessionResponse)
