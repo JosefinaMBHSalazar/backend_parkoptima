@@ -96,6 +96,7 @@ class VehicleAccount(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     plate_number = Column(String(32), nullable=False, unique=True, index=True)
+    email = Column(String(120), nullable=True, unique=True, index=True)
     pin_hash = Column(String(255), nullable=False)
     owner_name = Column(String(120), nullable=True)
     contact = Column(String(30), nullable=True)

@@ -124,6 +124,7 @@ class LoginRequest(BaseModel):
 
 class VehicleAccountCreate(BaseModel):
     plate_number: str
+    email: Optional[str] = None
     pin: str
     owner_name: Optional[str] = None
     contact: Optional[str] = None
@@ -132,7 +133,8 @@ class VehicleAccountCreate(BaseModel):
 
 
 class VehicleAccountLogin(BaseModel):
-    plate_number: str
+    email: Optional[str] = None
+    plate_number: Optional[str] = None
     pin: str
 
 

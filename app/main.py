@@ -545,10 +545,20 @@ def vehicle_owner_signup(payload: VehicleAccountCreate, db: Session = Depends(ge
     existing = db.query(VehicleAccount).filter(VehicleAccount.plate_number == plate).first()
     if existing:
         raise HTTPException(status_code=400, detail="Plate number is already registered")
+    
+    # Check email uniqueness if provided
+    if payload.email:
+        email_lower = payload.email.strip().lower()
+        existing_email = db.query(VehicleAccount).filter(VehicleAccount.email == email_lower).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email is already registered")
+    else:
+        email_lower = None
 
     pin_hash = bcrypt.hashpw(payload.pin.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     account = VehicleAccount(
         plate_number=plate,
+        email=email_lower,
         pin_hash=pin_hash,
         owner_name=payload.owner_name,
         contact=payload.contact,
@@ -565,9 +575,9 @@ def vehicle_owner_signup(payload: VehicleAccountCreate, db: Session = Depends(ge
 @app.post("/vehicle-owner/login")
 def vehicle_owner_login(payload: VehicleAccountLogin, db: Session = Depends(get_db)):
     try:
-        account = authenticate_vehicle_owner(db, payload.plate_number, payload.pin)
+        account = authenticate_vehicle_owner(db, plate_number=payload.plate_number, email=payload.email, pin=payload.pin)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail="Invalid plate number or PIN") from exc
+        raise HTTPException(status_code=401, detail="Invalid credentials") from exc
 
     return {
         "message": "Login successful",
@@ -579,7 +589,7 @@ def vehicle_owner_login(payload: VehicleAccountLogin, db: Session = Depends(get_
 @app.post("/vehicle-owner/balance")
 def vehicle_owner_balance(payload: VehicleAccountLogin, db: Session = Depends(get_db)):
     try:
-        account = authenticate_vehicle_owner(db, payload.plate_number, payload.pin)
+        account = authenticate_vehicle_owner(db, plate_number=payload.plate_number, email=payload.email, pin=payload.pin)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="No account found") from exc
 

@@ -77,22 +77,35 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
     raise ValueError("invalid credentials")
 
 
-def authenticate_vehicle_owner(db: Session, plate_number: str, pin: str) -> Dict[str, object]:
-    """Authenticate a vehicle owner by plate number + PIN."""
-    normalized = (plate_number or "").strip().upper()
-    account = db.query(VehicleAccount).filter(VehicleAccount.plate_number == normalized).first()
+def authenticate_vehicle_owner(db: Session, plate_number: str = None, pin: str = None, email: str = None) -> Dict[str, object]:
+    """Authenticate a vehicle owner by plate number or email + PIN."""
+    account = None
     
-    if account is None:
-        logger.warning(f"Vehicle account not found for plate: {normalized}")
+    if email:
+        # Look up by email
+        normalized_email = (email or "").strip().lower()
+        account = db.query(VehicleAccount).filter(VehicleAccount.email == normalized_email).first()
+        if account is None:
+            logger.warning(f"Vehicle account not found for email: {normalized_email}")
+            raise ValueError("invalid credentials")
+        logger.info(f"Found vehicle account for email: {normalized_email}")
+    elif plate_number:
+        # Look up by plate number
+        normalized_plate = (plate_number or "").strip().upper()
+        account = db.query(VehicleAccount).filter(VehicleAccount.plate_number == normalized_plate).first()
+        if account is None:
+            logger.warning(f"Vehicle account not found for plate: {normalized_plate}")
+            raise ValueError("invalid credentials")
+        logger.info(f"Found vehicle account for plate: {normalized_plate}")
+    else:
         raise ValueError("invalid credentials")
-    
-    logger.info(f"Found vehicle account for plate: {normalized}")
     
     if not _verify_password(pin, account.pin_hash):
-        logger.warning(f"PIN verification failed for plate: {normalized}")
+        identifier = email or plate_number
+        logger.warning(f"PIN verification failed for: {identifier}")
         raise ValueError("invalid credentials")
 
-    logger.info(f"Vehicle owner authenticated: {normalized}")
+    logger.info(f"Vehicle owner authenticated: {account.plate_number}")
     return {
         "id": account.id,
         "plate_number": account.plate_number,
