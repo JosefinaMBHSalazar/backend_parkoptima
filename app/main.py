@@ -1,4 +1,9 @@
-﻿from datetime import datetime, timezone
+﻿import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from datetime import datetime, timezone
 import re
 from typing import List, Optional
 
@@ -7,6 +12,7 @@ import pytz
 from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session 
+from sqlalchemy import inspect, text
 
 from .database import Base, SessionLocal, engine, get_db
 from .models import (
@@ -19,6 +25,7 @@ from .models import (
     VehicleAccount,
     VehicleRegistration,
     WalletBalance,
+    Vehicle,  
 )
 from .schemas import (
     AuditLogCreate,
@@ -52,10 +59,14 @@ from .schemas import (
     PasswordChangeResponse,
     PasswordVerifyRequest,
     PasswordVerifyResponse,
+    VehicleCreate,  
 )
 from .services import analyze_scan_image, get_or_create_owner_profile, get_or_create_settings
 from .analytics_engine import build_natural_language_summary, recommend_slot
 import asyncio
+
+from .routes import password_reset
+
 from .auth import authenticate_vehicle_owner, authenticate_user, _verify_password
 from .pages.ownerdashboard import get_owner_dashboard_data
 from .pages.owneroverview import get_owner_overview_data
@@ -98,6 +109,42 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── Helper function to migrate database schema ──
+def migrate_database():
+    """Add missing columns to existing tables."""
+    inspector = inspect(engine)
+    
+    # Check if vehicle_accounts table has email column
+    try:
+        columns = inspector.get_columns('vehicle_accounts')
+        column_names = [col['name'] for col in columns]
+        
+        if 'email' not in column_names:
+            logger.info("Adding 'email' column to vehicle_accounts table...")
+            with engine.connect() as conn:
+                # SQLite doesn't support adding columns with IF NOT EXISTS
+                # So we check first
+                if engine.name == 'sqlite':
+                    conn.execute(text("ALTER TABLE vehicle_accounts ADD COLUMN email VARCHAR(120)"))
+                else:
+                    conn.execute(text("ALTER TABLE vehicle_accounts ADD COLUMN email VARCHAR(120) NULL"))
+                conn.commit()
+            logger.info("✅ Added 'email' column to vehicle_accounts")
+        else:
+            logger.info("✅ 'email' column already exists in vehicle_accounts")
+    except Exception as e:
+        logger.warning(f"Could not verify vehicle_accounts table: {e}")
+    
+    # Check if vehicles table exists - if not, create it
+    try:
+        inspector = inspect(engine)
+        if 'vehicles' not in inspector.get_table_names():
+            logger.info("Creating 'vehicles' table...")
+            Base.metadata.create_all(bind=engine)
+            logger.info("✅ 'vehicles' table created")
+    except Exception as e:
+        logger.warning(f"Could not create vehicles table: {e}")
 
 Base.metadata.create_all(bind=engine)
 
@@ -164,7 +211,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# â”€â”€â”€â”€â”€â”€ Timezone Helper â”€â”€â”€â”€â”€â”€
+app.include_router(password_reset.router)
+
+# ────── Timezone Helper ──────
 MANILA_TZ = pytz.timezone('Asia/Manila')
 
 def ensure_utc(dt):
@@ -185,6 +234,9 @@ def convert_to_manila(dt):
 
 @app.on_event("startup")
 def _seed_on_startup() -> None:
+    # First, migrate the database schema
+    migrate_database()
+    
     db = SessionLocal()
     try:
         seed_default_accounts(db)
@@ -219,25 +271,6 @@ def update_owner_profile(payload: OwnerProfileUpdate, db: Session = Depends(get_
     db.commit()
     db.refresh(profile)
     return profile
-
-
-@app.get("/owner/settings", response_model=SystemSettingsResponse)
-def get_settings(db: Session = Depends(get_db)):
-    settings = get_or_create_settings(db)
-    return settings
-
-
-@app.put("/owner/settings", response_model=SystemSettingsResponse)
-def update_settings(payload: SystemSettingsBase, db: Session = Depends(get_db)):
-    settings = get_or_create_settings(db)
-    settings.system_name = payload.system_name
-    settings.motor_fee = payload.motor_fee
-    settings.four_wheel_fee = payload.four_wheel_fee
-    settings.total_motor_slots = payload.total_motor_slots
-    settings.total_four_wheel_slots = payload.total_four_wheel_slots
-    db.commit()
-    db.refresh(settings)
-    return settings
 
 
 @app.get("/owner/sessions", response_model=List[ParkingSessionResponse])
@@ -440,7 +473,7 @@ def vehicle_owner_dashboard(db: Session = Depends(get_db)):
     return get_vehicle_owner_dashboard_data(db)
 
 
-# â”€â”€ Authentication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Authentication ─────────────────────────────────────────────
 
 @app.post("/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
@@ -462,7 +495,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     }
 
 
-# â”€â”€ Password Management Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Password Management Endpoints ─────────────────────────────
 
 @app.post("/auth/verify-password", response_model=PasswordVerifyResponse)
 def verify_password(payload: PasswordVerifyRequest, db: Session = Depends(get_db)):
@@ -810,9 +843,9 @@ def vehicle_registration():
     return get_vehicle_registration_data()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# API routes consumed by the React frontend (vite proxies /api â†’ backend)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────────────────────
+# API routes consumed by the React frontend (vite proxies /api → backend)
+# ──────────────────────────────────────────────────────────────
 
 def _api_normalize_vehicle_type(vehicle_type: Optional[str]) -> str:
     """Collapse backend ``vehicle_type`` values to the UI vocabulary."""
@@ -829,7 +862,7 @@ def api_health_check():
     return {"status": "ok"}
 
 
-# â”€â”€ Sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Sessions ─────────────────────────────────────────────────
 @app.get("/api/sessions", response_model=List[ParkingSessionResponse])
 def api_list_sessions(db: Session = Depends(get_db)):
     sessions = db.query(ParkingSession).order_by(ParkingSession.entry_time.desc()).all()
@@ -978,13 +1011,121 @@ def api_session_payment(session_id: int, payload: PaymentMethodRequest, db: Sess
     return session
 
 
-# â”€â”€ Vehicles (union of registered users + sessions) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Vehicles (union of registered users + sessions) ──────────
 @app.get("/api/vehicles", response_model=VehiclesResponse)
 def api_get_vehicles(db: Session = Depends(get_db)):
     return {"vehicles": get_vehicles(db)}
 
 
-# â”€â”€ Audit log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Vehicle Management ─────────────────────────────────────────
+
+@app.post("/api/users/{user_id}/vehicles", response_model=VehicleCreate)
+def add_vehicle(user_id: int, payload: VehicleCreate, db: Session = Depends(get_db)):
+    """Add a new vehicle to a user's account"""
+    # Check if user exists
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if plate number already exists in vehicles table
+    existing_vehicle = db.query(Vehicle).filter(Vehicle.plate_number == payload.plate_number).first()
+    if existing_vehicle:
+        raise HTTPException(status_code=400, detail="Plate number is already registered")
+    
+    # Also check if plate exists in users table (for backward compatibility)
+    existing_user = db.query(User).filter(User.plate_number == payload.plate_number).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Plate number is already registered")
+    
+    # If this is the primary vehicle, unset any existing primary
+    if payload.is_primary:
+        db.query(Vehicle).filter(Vehicle.user_id == user_id).update({"is_primary": False})
+    
+    vehicle = Vehicle(
+        user_id=user_id,
+        plate_number=payload.plate_number,
+        vehicle_type=payload.vehicle_type,
+        brand=payload.brand,
+        model=payload.model,
+        color=payload.color,
+        is_primary=payload.is_primary
+    )
+    db.add(vehicle)
+    db.commit()
+    db.refresh(vehicle)
+    return vehicle
+
+
+@app.get("/api/users/{user_id}/vehicles")
+def get_user_vehicles(user_id: int, db: Session = Depends(get_db)):
+    """Get all vehicles for a user"""
+    vehicles = db.query(Vehicle).filter(Vehicle.user_id == user_id).all()
+    return vehicles
+
+
+@app.put("/api/users/{user_id}/vehicles/{vehicle_id}", response_model=VehicleCreate)
+def update_vehicle(user_id: int, vehicle_id: int, payload: VehicleCreate, db: Session = Depends(get_db)):
+    """Update a vehicle"""
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id, Vehicle.user_id == user_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    # Check if plate number already exists (excluding this vehicle)
+    existing = db.query(Vehicle).filter(
+        Vehicle.plate_number == payload.plate_number,
+        Vehicle.id != vehicle_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Plate number is already registered")
+    
+    # Also check users table
+    existing_user = db.query(User).filter(User.plate_number == payload.plate_number).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Plate number is already registered")
+    
+    vehicle.plate_number = payload.plate_number
+    vehicle.vehicle_type = payload.vehicle_type
+    vehicle.brand = payload.brand
+    vehicle.model = payload.model
+    vehicle.color = payload.color
+    vehicle.is_primary = payload.is_primary
+    
+    db.commit()
+    db.refresh(vehicle)
+    return vehicle
+
+
+@app.delete("/api/users/{user_id}/vehicles/{vehicle_id}")
+def delete_vehicle(user_id: int, vehicle_id: int, db: Session = Depends(get_db)):
+    """Delete a vehicle"""
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id, Vehicle.user_id == user_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    db.delete(vehicle)
+    db.commit()
+    return {"message": "Vehicle deleted successfully"}
+
+
+@app.get("/api/vehicles/check/{plate_number}")
+def check_plate_exists(plate_number: str, db: Session = Depends(get_db)):
+    """Check if a plate number already exists in the system"""
+    normalized = plate_number.replace(" ", "").upper()
+    
+    # Check in vehicles table
+    vehicle = db.query(Vehicle).filter(Vehicle.plate_number == normalized).first()
+    if vehicle:
+        return {"exists": True, "table": "vehicles", "user_id": vehicle.user_id}
+    
+    # Check in users table (for backward compatibility)
+    user = db.query(User).filter(User.plate_number == normalized).first()
+    if user:
+        return {"exists": True, "table": "users", "user_id": user.id}
+    
+    return {"exists": False}
+
+
+# ── Audit log ────────────────────────────────────────────────
 @app.get("/api/audit-log", response_model=List[AuditLogResponse])
 def api_get_audit_logs(db: Session = Depends(get_db)):
     return get_audit_logs(db)
@@ -1003,7 +1144,7 @@ def api_create_audit_log(payload: AuditLogCreate, db: Session = Depends(get_db))
     )
 
 
-# â”€â”€ Users management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Users management ─────────────────────────────────────────
 @app.get("/api/users", response_model=List[UserResponse])
 def api_get_users(db: Session = Depends(get_db)):
     return get_users(db)
@@ -1058,7 +1199,24 @@ def api_delete_user(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
 
 
-# â”€â”€ Owner profile & settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.get("/api/users/plate/{plate_number}")
+def api_get_user_by_plate(plate_number: str, db: Session = Depends(get_db)):
+    """Check if a plate number is registered in the system."""
+    plate = plate_number.strip().upper()
+    user = db.query(User).filter(User.plate_number == plate).first()
+    
+    if user:
+        return {
+            "plate_number": user.plate_number,
+            "full_name": user.full_name,
+            "vehicle_type": user.vehicle_type,
+            "is_registered": True
+        }
+    else:
+        raise HTTPException(status_code=404, detail="Plate not found")
+
+
+# ── Owner profile & settings ─────────────────────────────────
 @app.get("/api/owner/profile", response_model=OwnerProfileResponse)
 def api_get_owner_profile(db: Session = Depends(get_db)):
     return get_owner_profile(db)
@@ -1066,20 +1224,99 @@ def api_get_owner_profile(db: Session = Depends(get_db)):
 
 @app.put("/api/owner/profile", response_model=OwnerProfileResponse)
 def api_update_owner_profile(payload: OwnerProfileUpdate, db: Session = Depends(get_db)):
-    return update_owner_profile(payload, db)
+    profile = get_or_create_owner_profile(db)
+    
+    if payload.full_name is not None:
+        profile.full_name = payload.full_name
+    if payload.email is not None:
+        profile.email = payload.email
+    if payload.image_url is not None:
+        profile.image_url = payload.image_url
+    if payload.password:
+        profile.password_hash = bcrypt.hashpw(
+            payload.password.encode("utf-8"), bcrypt.gensalt()
+        ).decode("utf-8")
+    
+    db.commit()
+    db.refresh(profile)
+    
+    # Return the updated profile
+    return OwnerProfileResponse(
+        id=profile.id,
+        full_name=profile.full_name,
+        email=profile.email,
+        image_url=profile.image_url,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at
+    )
 
+
+# ── Owner System Settings ─────────────────────────────────────
 
 @app.get("/api/owner/settings", response_model=SystemSettingsResponse)
 def api_get_settings(db: Session = Depends(get_db)):
-    return get_settings(db)
+    settings = get_or_create_settings(db)
+
+    logger.info(
+        f"GET SETTINGS -> id={settings.id}, "
+        f"parking_capacity={settings.parking_capacity}"
+    )
+
+    return settings
 
 
 @app.put("/api/owner/settings", response_model=SystemSettingsResponse)
-def api_update_settings(payload: SystemSettingsBase, db: Session = Depends(get_db)):
-    return update_settings(payload, db)
+def api_update_settings(
+    payload: SystemSettingsBase,
+    db: Session = Depends(get_db)
+):
+    logger.info("========== UPDATE SYSTEM SETTINGS ==========")
+    logger.info(f"Incoming payload: {payload.dict()}")
+
+    settings = get_or_create_settings(db)
+    
+    # Store old values for comparison
+    old_capacity = settings.parking_capacity
+    logger.info(f"Old parking_capacity: {old_capacity}")
+
+    # Update the actual SQLAlchemy object
+    settings.system_name = payload.system_name
+    settings.motor_fee = payload.motor_fee
+    settings.four_wheel_fee = payload.four_wheel_fee
+    settings.parking_capacity = payload.parking_capacity
+
+    logger.info(
+        f"Saving -> system_name={settings.system_name}, "
+        f"motor_fee={settings.motor_fee}, "
+        f"four_wheel_fee={settings.four_wheel_fee}, "
+        f"parking_capacity={settings.parking_capacity}"
+    )
+
+    try:
+        # Log before commit
+        logger.info("Attempting to commit to database...")
+        db.commit()
+        logger.info("✅ Commit successful!")
+        
+        db.refresh(settings)
+        logger.info(f"REFRESHED VALUE -> parking_capacity={settings.parking_capacity}")
+
+        # Double-check with a direct query
+        direct_check = db.query(SystemSettings).first()
+        logger.info(f"DIRECT QUERY CHECK -> parking_capacity={direct_check.parking_capacity if direct_check else 'NO RECORD'}")
+
+        return settings
+
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"❌ Failed to save system settings: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save system settings: {str(e)}"
+        )
 
 
-# â”€â”€ Profile (current logged-in user) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Profile (current logged-in user) ─────────────────────────
 @app.get("/api/profile")
 def api_get_profile(role: Optional[str] = None, db: Session = Depends(get_db)):
     if role == "owner":
@@ -1092,7 +1329,7 @@ def api_get_profile(role: Optional[str] = None, db: Session = Depends(get_db)):
         }
     users = db.query(User).filter(User.role == (role or "vehicle_owner")).all()
     if not users:
-        return {"role": role or "vehicle_owner", "full_name": "â€”", "email": "", "image_url": None}
+        return {"role": role or "vehicle_owner", "full_name": "—", "email": "", "image_url": None}
     user = users[0]
     return {
         "role": user.role,
@@ -1120,7 +1357,7 @@ def api_update_profile(payload: ProfileUpdate, db: Session = Depends(get_db)):
     return profile
 
 
-# â”€â”€ Vehicle owner balance / signup (API aliases) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Vehicle owner balance / signup (API aliases) ──────────────
 @app.post("/api/vehicle-owner/balance")
 def api_vehicle_owner_balance(payload: VehicleAccountLogin, db: Session = Depends(get_db)):
     return vehicle_owner_balance(payload, db)
@@ -1131,7 +1368,7 @@ def api_vehicle_owner_signup(payload: VehicleAccountCreate, db: Session = Depend
     return vehicle_owner_signup(payload, db)
 
 
-# â”€â”€ Wallet (server-side, atomic) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Wallet (server-side, atomic) ─────────────────────────────
 @app.post("/api/wallet/top-up", response_model=VehicleAccountResponse)
 def api_wallet_top_up(payload: WalletTopUpRequest, db: Session = Depends(get_db)):
     try:
@@ -1159,7 +1396,7 @@ def api_wallet_deduct(payload: WalletDeductRequest, db: Session = Depends(get_db
     return account
 
 
-# â”€â”€ Wallet Balance (new dedicated table) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Wallet Balance (new dedicated table) ──────────────────────
 
 @app.get("/api/wallet-balance/{plate_number}")
 def api_get_wallet_balance(plate_number: str, db: Session = Depends(get_db)):

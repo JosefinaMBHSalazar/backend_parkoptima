@@ -23,17 +23,15 @@ class OwnerProfileResponse(OwnerProfileBase):
 
 
 class SystemSettingsBase(BaseModel):
-    system_name: str
-    motor_fee: float
-    four_wheel_fee: float
-    total_motor_slots: int = 50
-    total_four_wheel_slots: int = 50
-
+    system_name: str = "ParkOptima"
+    motor_fee: float = 5.0
+    four_wheel_fee: float = 20.0
+    parking_capacity: int = 100
 
 class SystemSettingsResponse(SystemSettingsBase):
     id: int
-    updated_at: datetime
-
+    updated_at: Optional[datetime] = None  
+    
     class Config:
         from_attributes = True
 
@@ -109,8 +107,10 @@ class UserResponse(BaseModel):
     brand: Optional[str] = None
     model: Optional[str] = None
     color: Optional[str] = None
+    status: Optional[str] = "Active"
     created_at: datetime
     updated_at: datetime
+    image_url: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -195,6 +195,7 @@ class UserUpdate(BaseModel):
     model: Optional[str] = None
     color: Optional[str] = None
     password: Optional[str] = None
+    image_url: Optional[str] = None
 
 
 class AuditLogCreate(BaseModel):
@@ -230,6 +231,15 @@ class WalletDeductRequest(BaseModel):
     amount: float
     session_id: Optional[int] = None
     method: Optional[str] = "wallet"
+
+class VehicleCreate(BaseModel):
+    plate_number: str
+    vehicle_type: str = "motor"
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    color: Optional[str] = None
+    is_primary: bool = False
+
 
 
 class VehicleListItem(BaseModel):

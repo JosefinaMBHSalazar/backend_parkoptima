@@ -15,8 +15,9 @@ def update_user(db: Session, user_id: int, data) -> User:
     if user is None:
         return None
 
+    # ✅ ADDED 'image_url' to the list of fields
     for field in ("full_name", "email", "role", "status", "plate_number",
-                 "contact", "vehicle_type", "brand", "model", "color"):
+                 "contact", "vehicle_type", "brand", "model", "color", "image_url"):
         value = getattr(data, field, None)
         if value is not None:
             setattr(user, field, value)

@@ -43,10 +43,10 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
     user = db.query(User).filter(User.email == normalized).first()
     if user:
         logger.info(f"Found user in users table: {user.email}, role: {user.role}")
-        logger.info(f"Password hash length: {len(user.password_hash) if user.password_hash else 0}")
+        logger.info(f"Password hash: {user.password_hash[:30]}..." if user.password_hash else "No password hash")
         
         if _verify_password(password, user.password_hash):
-            logger.info(f"Password verified for user: {user.email}")
+            logger.info(f"✅ Password verified for user: {user.email}")
             return {
                 "id": user.id,
                 "full_name": user.full_name,
@@ -54,16 +54,16 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
                 "role": user.role,
             }
         else:
-            logger.warning(f"Password verification failed for user: {user.email}")
+            logger.warning(f"❌ Password verification failed for user: {user.email}")
 
     # Backwards-compatible fallback: owner profile
     profile = db.query(OwnerProfile).filter(OwnerProfile.email == normalized).first()
     if profile:
         logger.info(f"Found user in owner_profiles table: {profile.email}")
-        logger.info(f"Password hash length: {len(profile.password_hash) if profile.password_hash else 0}")
+        logger.info(f"Password hash: {profile.password_hash[:30]}..." if profile.password_hash else "No password hash")
         
         if _verify_password(password, profile.password_hash):
-            logger.info(f"Password verified for owner profile: {profile.email}")
+            logger.info(f"✅ Password verified for owner profile: {profile.email}")
             return {
                 "id": profile.id,
                 "full_name": profile.full_name,
@@ -71,9 +71,12 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
                 "role": "owner",
             }
         else:
-            logger.warning(f"Password verification failed for owner profile: {profile.email}")
+            logger.warning(f"❌ Password verification failed for owner profile: {profile.email}")
 
-    logger.warning(f"Authentication failed for user: {normalized}")
+    # If we get here, check if the email exists at all (for debugging)
+    user_exists = db.query(User).filter(User.email == normalized).first() is not None
+    profile_exists = db.query(OwnerProfile).filter(OwnerProfile.email == normalized).first() is not None
+    logger.warning(f"Authentication failed for user: {normalized}. User exists: {user_exists}, Profile exists: {profile_exists}")
     raise ValueError("invalid credentials")
 
 
@@ -105,7 +108,7 @@ def authenticate_vehicle_owner(db: Session, plate_number: str = None, pin: str =
         logger.warning(f"PIN verification failed for: {identifier}")
         raise ValueError("invalid credentials")
 
-    logger.info(f"Vehicle owner authenticated: {account.plate_number}")
+    logger.info(f"✅ Vehicle owner authenticated: {account.plate_number}")
     return {
         "id": account.id,
         "plate_number": account.plate_number,

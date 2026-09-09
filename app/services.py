@@ -57,10 +57,24 @@ def _detect_vehicle_type_with_yolo(image) -> Optional[str]:
 def get_or_create_settings(db: Session) -> SystemSettings:
     settings = db.query(SystemSettings).first()
     if settings is None:
-        settings = SystemSettings(system_name="ParkOptima", motor_fee=5.0, four_wheel_fee=20.0)
+        logger.info("🆕 No settings found, creating default settings...")
+        settings = SystemSettings(
+            system_name="ParkOptima",
+            motor_fee=5.0,
+            four_wheel_fee=20.0,
+            parking_capacity=100,
+        )
         db.add(settings)
-        db.commit()
-        db.refresh(settings)
+        try:
+            db.commit()
+            db.refresh(settings)
+            logger.info(f"✅ Created new settings with parking_capacity: {settings.parking_capacity}")
+        except Exception as e:
+            logger.error(f"❌ Failed to create settings: {e}")
+            db.rollback()
+            raise
+    else:
+        logger.info(f"📊 Retrieved settings with parking_capacity: {settings.parking_capacity}")
     return settings
 
 

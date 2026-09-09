@@ -23,6 +23,38 @@ def get_or_create_wallet_balance(db: Session, plate_number: str) -> WalletBalanc
     wallet = db.query(WalletBalance).filter(WalletBalance.plate_number == plate).first()
     
     if wallet is None:
+        # First, check if the user exists in the users table
+        user = db.query(User).filter(User.plate_number == plate).first()
+        
+        # If user doesn't exist, create a minimal user entry first
+        if user is None:
+            # Check if there's a vehicle account
+            account = db.query(VehicleAccount).filter(VehicleAccount.plate_number == plate).first()
+            
+            if account is not None:
+                # Create user from vehicle account
+                user = User(
+                    plate_number=plate,
+                    full_name=account.owner_name or "Unknown",
+                    vehicle_type=account.vehicle_type or "Motor",
+                    brand=account.brand or "",
+                    contact=account.contact or "",
+                    status="active"
+                )
+            else:
+                # Create a minimal user entry for this plate
+                user = User(
+                    plate_number=plate,
+                    full_name="Unknown Owner",
+                    vehicle_type="Motor",
+                    brand="",
+                    contact="",
+                    status="active"
+                )
+            
+            db.add(user)
+            db.flush()  # Flush to get the user ID without committing
+        
         wallet = WalletBalance(plate_number=plate, balance=0.0)
         db.add(wallet)
         db.commit()
@@ -98,7 +130,7 @@ def deduct_wallet(db: Session, plate_number: str, amount: float,
     
     current = float(wallet.balance or 0.0)
     if current < amount:
-        raise ValueError(f"Insufficient wallet balance. Current: â‚±{current:.2f}, Required: â‚±{amount:.2f}")
+        raise ValueError(f"Insufficient wallet balance. Current: ₱{current:.2f}, Required: ₱{amount:.2f}")
 
     wallet.balance = current - amount
     wallet.updated_at = datetime.now()

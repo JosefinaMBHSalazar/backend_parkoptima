@@ -1,5 +1,6 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Text
+from sqlalchemy import Column, Integer, String, DateTime, Float, Text, Boolean
 from sqlalchemy.sql import func
+from datetime import datetime  
 from .database import Base
 
 
@@ -15,15 +16,24 @@ class OwnerProfile(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), index=True)
+    token = Column(String(255), unique=True, index=True)  
+    expires_at = Column(DateTime)
+    used = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class SystemSettings(Base):
     __tablename__ = "system_settings"
-
     id = Column(Integer, primary_key=True, index=True)
     system_name = Column(String(120), nullable=False, default="ParkOptima")
     motor_fee = Column(Float, nullable=False, default=5.0)
     four_wheel_fee = Column(Float, nullable=False, default=20.0)
-    total_motor_slots = Column(Integer, nullable=False, default=50)
-    total_four_wheel_slots = Column(Integer, nullable=False, default=50)
+    parking_capacity = Column(Integer, nullable=False, default=100)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
@@ -71,7 +81,21 @@ class User(Base):
     color = Column(String(40), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    image_url = Column(String(500), nullable=True)
 
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    plate_number = Column(String(32), nullable=False, unique=True, index=True)
+    vehicle_type = Column(String(20), nullable=False, default="motor")
+    brand = Column(String(60), nullable=True)
+    model = Column(String(60), nullable=True)
+    color = Column(String(40), nullable=True)
+    is_primary = Column(Boolean, default=False) 
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 class VehicleRegistration(Base):
     __tablename__ = "vehicle_registrations"
@@ -120,6 +144,7 @@ class AuditLog(Base):
     reference_id = Column(String(120), nullable=True)
     details = Column(Text, nullable=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
 
 class WalletBalance(Base):
     __tablename__ = "wallet_balances"

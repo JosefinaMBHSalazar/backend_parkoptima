@@ -16,12 +16,20 @@ def _active_sessions(db: Session) -> List[ParkingSession]:
 
 
 def _slot_ids(settings: SystemSettings) -> List[str]:
-    total = max((settings.total_motor_slots or 0) + (settings.total_four_wheel_slots or 0), 1)
+    # ✅ FIXED: Use parking_capacity instead of non-existent total_motor_slots/total_four_wheel_slots
+    total = max(settings.parking_capacity or 100, 1)
     return [f"S{number}" for number in range(1, total + 1)]
 
 
 def recommend_slot(db: Session, vehicle_type: str, requested_slot: str | None = None) -> Dict[str, Any]:
-    settings = db.query(SystemSettings).first() or SystemSettings(total_motor_slots=50, total_four_wheel_slots=50)
+    settings = db.query(SystemSettings).first()
+    if not settings:
+        # Create default settings if none exist
+        settings = SystemSettings(parking_capacity=100)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    
     slots = _slot_ids(settings)
     occupied = {session.slot for session in _active_sessions(db) if session.slot}
     if requested_slot:
