@@ -48,8 +48,10 @@ class ParkingSession(Base):
     fee = Column(Float, nullable=False, default=0.0)
     payment_method = Column(String(30), nullable=True)
     status = Column(String(20), nullable=False, default="parked")
-    slot = Column(String(20), nullable=True)
     notes = Column(Text, nullable=True)
+    plate_type = Column(String(20), nullable=False, default="registered", index=True)   
+    entry_method = Column(String(20), nullable=False, default="scan")                    
+    created_by = Column(String(120), nullable=True)                                       
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 

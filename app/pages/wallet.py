@@ -138,7 +138,7 @@ def deduct_wallet(db: Session, plate_number: str, amount: float,
     db.commit()
     db.refresh(wallet)
 
-    # Fix: use None if session_id is 0 or None
+    #Fix: use None if session_id is 0 or None
     transaction = PaymentTransaction(session_id=session_id if session_id > 0 else None, amount=amount, method=method)
     db.add(transaction)
     db.commit()

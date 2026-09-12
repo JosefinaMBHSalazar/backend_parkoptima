@@ -62,12 +62,12 @@ from .schemas import (
     VehicleCreate,  
 )
 from .services import analyze_scan_image, get_or_create_owner_profile, get_or_create_settings
-from .analytics_engine import build_natural_language_summary, recommend_slot
+from .analytics_engine import build_natural_language_summary
 import asyncio
 
 from .routes import password_reset
 
-from .auth import authenticate_vehicle_owner, authenticate_user, _verify_password
+from .auth import ( authenticate_vehicle_owner, authenticate_user, _verify_password, InactiveAccountError,)
 from .pages.ownerdashboard import get_owner_dashboard_data
 from .pages.owneroverview import get_owner_overview_data
 from .pages.attendantdashboard import get_attendant_dashboard_data
@@ -146,6 +146,46 @@ def migrate_database():
     except Exception as e:
         logger.warning(f"Could not create vehicles table: {e}")
 
+    # ── parking_sessions: plate_type, entry_method, created_by ──
+    try:
+        columns = inspector.get_columns('parking_sessions')
+        col_names = [c['name'] for c in columns]
+
+        with engine.connect() as conn:
+            if 'plate_type' not in col_names:
+                logger.info("Adding 'plate_type' column to parking_sessions...")
+                conn.execute(text("ALTER TABLE parking_sessions ADD COLUMN plate_type VARCHAR(20) DEFAULT 'registered'"))
+                conn.commit()
+                logger.info("✅ Added 'plate_type'")
+
+            if 'entry_method' not in col_names:
+                logger.info("Adding 'entry_method' column to parking_sessions...")
+                conn.execute(text("ALTER TABLE parking_sessions ADD COLUMN entry_method VARCHAR(20) DEFAULT 'scan'"))
+                conn.commit()
+                logger.info("✅ Added 'entry_method'")
+
+            if 'created_by' not in col_names:
+                logger.info("Adding 'created_by' column to parking_sessions...")
+                conn.execute(text("ALTER TABLE parking_sessions ADD COLUMN created_by VARCHAR(120)"))
+                conn.commit()
+                logger.info("✅ Added 'created_by'")
+    except Exception as e:
+        logger.warning(f"Could not add parking_sessions columns: {e}")
+
+    # ── parking_sessions: drop the deprecated 'slot' column ──
+    try:
+        columns = [c['name'] for c in inspector.get_columns('parking_sessions')]
+        if 'slot' in columns:
+            logger.info("Dropping 'slot' column from parking_sessions...")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE parking_sessions DROP COLUMN slot"))
+                conn.commit()
+            logger.info("✅ Dropped 'slot'")
+        else:
+            logger.info("✅ 'slot' column already dropped from parking_sessions")
+    except Exception as e:
+        logger.warning(f"Could not drop parking_sessions.slot: {e}")
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ParkOptima Owner Backend", version="1.0.0")
@@ -181,7 +221,6 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -314,9 +353,8 @@ def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
         fee=payload.fee or (settings.motor_fee if payload.vehicle_type == "motor" else settings.four_wheel_fee),
         payment_method=payload.payment_method,
         status=payload.status,
-        slot=payload.slot,
         notes=payload.notes,
-        entry_time=datetime.now(pytz.UTC),  # Use timezone-aware UTC
+        entry_time=datetime.now(pytz.UTC),
     )
     db.add(session)
     db.commit()
@@ -328,7 +366,6 @@ def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
             'session': {
                 'id': session.id,
                 'plate_number': session.plate_number,
-                'slot': session.slot,
                 'status': session.status,
                 'entry_time': session.entry_time.isoformat() if session.entry_time is not None else None,
                 'vehicle_type': session.vehicle_type,
@@ -422,7 +459,6 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
             'session': {
                 'id': session.id,
                 'plate_number': session.plate_number,
-                'slot': session.slot,
                 'status': session.status,
                 'payment_method': session.payment_method,
             },
@@ -479,6 +515,13 @@ def vehicle_owner_dashboard(db: Session = Depends(get_db)):
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     try:
         user = authenticate_user(db, payload.email, payload.password)
+    except InactiveAccountError as exc:
+        # Distinct 403 so the user knows their account is disabled,
+        # instead of the generic "invalid credentials" 401.
+        raise HTTPException(
+            status_code=403,
+            detail="Your account has been deactivated. Please contact the owner.",
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid email or password") from exc
 
@@ -857,6 +900,38 @@ def _api_normalize_vehicle_type(vehicle_type: Optional[str]) -> str:
     return "motor"
 
 
+
+def resolve_wallet_owner_plate(db: Session, plate_number: str) -> Optional[str]:
+    """For a given plate, return the plate whose wallet actually holds the
+    balance.
+
+    Resolution order:
+      1. The plate itself, if it's already a primary vehicle in `users`.
+      2. The owner's primary plate, if the plate is in `vehicles` as a
+         non-primary vehicle.
+      3. None — the plate isn't registered anywhere (caller should fall
+         back to creating its own wallet row).
+    """
+    if not plate_number:
+        return None
+    plate = plate_number.replace(" ", "").upper()
+
+    # 1️⃣ Primary vehicle in users table
+    user = db.query(User).filter(User.plate_number == plate).first()
+    if user:
+        return user.plate_number  # its own wallet
+
+    # 2️⃣ Additional vehicle in vehicles table
+    vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
+    if vehicle:
+        # Find the owner
+        owner = db.query(User).filter(User.id == vehicle.user_id).first()
+        if owner and owner.plate_number:
+            return owner.plate_number  # primary plate = source of truth
+        # No primary plate on file — fall through
+    return None
+
+
 @app.get("/api/health")
 def api_health_check():
     return {"status": "ok"}
@@ -879,52 +954,94 @@ def api_list_sessions(db: Session = Depends(get_db)):
 
 @app.post("/api/sessions", response_model=ParkingSessionResponse, status_code=status.HTTP_201_CREATED)
 def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
-    # Check for duplicate active session
+    settings = get_or_create_settings(db)
+
+    plate_type = (payload.plate_type or "registered").lower()
+    if plate_type not in ("registered", "temporary", "no_plate"):
+        raise HTTPException(status_code=422, detail="Invalid plate_type")
+
+    # ── Auto-generate an identifier for no-plate entries ──
+    plate_number = (payload.plate_number or "").strip().upper()
+
+    # Treat placeholder values as "empty" for no_plate entries so the
+    # backend always generates a fresh, unique NOPLATE-YYYYMMDD-NNNN.
+    PLACEHOLDER_PLATES = {"AUTO", "AUTO-ID", "NO_PLATE", "NOPLATE", "N/A", "NA", "-"}
+
+    if plate_type == "no_plate" and (not plate_number or plate_number in PLACEHOLDER_PLATES):
+        today = datetime.now(MANILA_TZ).strftime("%Y%m%d")
+        existing_today = db.query(ParkingSession).filter(
+            ParkingSession.plate_type == "no_plate",
+            ParkingSession.plate_number.like(f"NOPLATE-{today}-%")
+        ).count()
+        plate_number = f"NOPLATE-{today}-{existing_today + 1:04d}"
+
+    if not plate_number:
+        raise HTTPException(status_code=422, detail="plate_number is required")
+
+    # ── Format check only applies to registered plates from scan flow ──
+    if plate_type == "registered" and payload.entry_method == "scan":
+        normalized = plate_number.replace(" ", "").upper()
+        if not re.match(r"^[A-Z0-9]{4,8}$", normalized):
+            raise HTTPException(status_code=422, detail="Invalid registered plate format")
+
+    # ── Duplicate active-session check ──
     existing = db.query(ParkingSession).filter(
-        ParkingSession.plate_number == payload.plate_number,
+        ParkingSession.plate_number == plate_number,
         ParkingSession.status == 'parked'
     ).first()
-    
+
     if existing:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Vehicle {payload.plate_number} is already parked (Session ID: {existing.id})"
+            status_code=400,
+            detail=f"Vehicle {plate_number} is already parked (Session ID: {existing.id})"
         )
-    
-    settings = get_or_create_settings(db)
+
     vehicle_type = _api_normalize_vehicle_type(payload.vehicle_type)
     fee = payload.fee
     if fee is None or fee == 0:
         fee = settings.motor_fee if vehicle_type == "motor" else settings.four_wheel_fee
-    
-    try:
-        slot = recommend_slot(db, vehicle_type, payload.slot)["recommended_slot"]
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # ── Server-side capacity guard ──
+    parked_count = db.query(ParkingSession).filter(ParkingSession.status == "parked").count()
+    if settings.parking_capacity and parked_count >= settings.parking_capacity:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Facility is full ({parked_count}/{settings.parking_capacity}). Entry blocked."
+        )
 
     session = ParkingSession(
-        plate_number=payload.plate_number.upper(),
+        plate_number=plate_number,
         vehicle_type=vehicle_type,
         fee=fee,
         payment_method=payload.payment_method,
         status=payload.status or "parked",
-        slot=slot,
         notes=payload.notes,
-        entry_time=datetime.now(pytz.UTC),  # Use timezone-aware UTC
+        plate_type=plate_type,
+        entry_method=payload.entry_method or "scan",
+        created_by=payload.created_by,
+        entry_time=datetime.now(pytz.UTC),
     )
     db.add(session)
     db.commit()
     db.refresh(session)
-    return session
 
-
-@app.get("/api/slots/recommend")
-def api_recommend_slot(vehicle_type: str = "motor", db: Session = Depends(get_db)):
     try:
-        return recommend_slot(db, _api_normalize_vehicle_type(vehicle_type))
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        asyncio.create_task(manager.broadcast({
+            'type': 'session_created',
+            'session': {
+                'id': session.id,
+                'plate_number': session.plate_number,
+                'plate_type': session.plate_type,
+                'entry_method': session.entry_method,
+                'status': session.status,
+                'entry_time': session.entry_time.isoformat() if session.entry_time is not None else None,
+                'vehicle_type': session.vehicle_type,
+            }
+        }))
+    except Exception:
+        pass
 
+    return session
 
 
 @app.get("/api/analytics/summary")
@@ -968,8 +1085,6 @@ def api_update_session(session_id: int, payload: ParkingSessionUpdate, db: Sessi
         if payload.status == "completed" and not session.exit_time:
             session.exit_time = datetime.now(pytz.UTC)  # Use timezone-aware UTC
         session.status = payload.status
-    if payload.slot is not None:
-        session.slot = payload.slot
     if payload.notes is not None:
         session.notes = payload.notes
     if payload.exit_time is not None:
@@ -1201,19 +1316,44 @@ def api_delete_user(user_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/users/plate/{plate_number}")
 def api_get_user_by_plate(plate_number: str, db: Session = Depends(get_db)):
-    """Check if a plate number is registered in the system."""
     plate = plate_number.strip().upper()
+
+    # 1️⃣ Check users table (primary vehicle / legacy)
     user = db.query(User).filter(User.plate_number == plate).first()
-    
     if user:
         return {
             "plate_number": user.plate_number,
             "full_name": user.full_name,
             "vehicle_type": user.vehicle_type,
-            "is_registered": True
+            "brand": user.brand,
+            "model": user.model,
+            "color": user.color,
+            "user_id": user.id,
+            "is_registered": True,
+            "source": "users",
+            # For a primary vehicle, the "owner plate" is itself
+            "owner_plate_number": user.plate_number,
         }
-    else:
-        raise HTTPException(status_code=404, detail="Plate not found")
+
+    # 2️⃣ Check vehicles table (additional vehicles)
+    vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
+    if vehicle:
+        owner = db.query(User).filter(User.id == vehicle.user_id).first()
+        return {
+            "plate_number": vehicle.plate_number,
+            "full_name": owner.full_name if owner else None,
+            "vehicle_type": vehicle.vehicle_type,
+            "brand": vehicle.brand,
+            "model": vehicle.model,
+            "color": vehicle.color,
+            "user_id": vehicle.user_id,
+            "is_registered": True,
+            "source": "vehicles",
+            # NEW: the owner's PRIMARY plate — this is what the wallet should use
+            "owner_plate_number": owner.plate_number if owner else None,
+        }
+
+    raise HTTPException(status_code=404, detail="Plate not found")
 
 
 # ── Owner profile & settings ─────────────────────────────────
@@ -1409,23 +1549,67 @@ def api_get_wallet_balance(plate_number: str, db: Session = Depends(get_db)):
 
 @app.get("/api/wallet-balance/amount/{plate_number}")
 def api_get_wallet_balance_amount(plate_number: str, db: Session = Depends(get_db)):
-    """Get just the balance amount for a plate number."""
+    """Get just the balance amount for a plate number.
+
+    For additional vehicles registered in the `vehicles` table, the
+    balance lives on the owner's primary plate wallet, so we resolve
+    to that plate before reading.
+    """
     try:
-        balance = get_wallet_balance_by_plate(db, plate_number)
-        return {"plate_number": plate_number, "balance": balance}
+        plate = plate_number.replace(" ", "").upper()
+
+        # Try the plate itself first
+        try:
+            balance = get_wallet_balance_by_plate(db, plate)
+            # If the plate has a wallet row, honor it even if 0 — the
+            # caller decides whether to fall back.
+            return {"plate_number": plate, "balance": balance}
+        except ValueError:
+            pass  # no wallet row for this plate yet
+
+        # Fall back: is this an additional vehicle?
+        owner_plate = resolve_wallet_owner_plate(db, plate)
+        if owner_plate and owner_plate != plate:
+            try:
+                balance = get_wallet_balance_by_plate(db, owner_plate)
+                return {"plate_number": plate, "balance": balance, "source_plate": owner_plate}
+            except ValueError:
+                pass
+
+        # Not registered / no wallet anywhere
+        raise ValueError(f"No wallet balance found for {plate}")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.post("/api/wallet-balance/top-up")
 def api_wallet_balance_top_up(
-    plate_number: str, 
-    amount: float, 
+    plate_number: str,
+    amount: float,
     db: Session = Depends(get_db)
 ):
-    """Top up a vehicle wallet using the wallet_balances table."""
+    """Top up a vehicle wallet.
+
+    If the plate is an additional vehicle (registered in `vehicles` as
+    a non-primary row), the money is applied to the owner's primary
+    plate wallet so the balance the owner sees on their primary plate
+    actually grows.
+    """
     try:
-        result = top_up_wallet(db, plate_number, amount)
+        plate = plate_number.replace(" ", "").upper()
+
+        # Resolve to the plate whose wallet should grow
+        target_plate = plate
+        owner_plate = resolve_wallet_owner_plate(db, plate)
+        if owner_plate and owner_plate != plate:
+            target_plate = owner_plate
+            logger.info(f"💰 Top-up for additional vehicle {plate} routed to primary plate wallet {target_plate}")
+
+        result = top_up_wallet(db, target_plate, amount)
+        # Echo the plate the caller asked about so the UI can display it
+        if isinstance(result, dict):
+            result.setdefault("plate_number", plate)
+            result.setdefault("source_plate", target_plate)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1433,15 +1617,32 @@ def api_wallet_balance_top_up(
 
 @app.post("/api/wallet-balance/deduct")
 def api_wallet_balance_deduct(
-    plate_number: str, 
-    amount: float, 
-    session_id: int = 0, 
+    plate_number: str,
+    amount: float,
+    session_id: int = 0,
     method: str = "wallet",
     db: Session = Depends(get_db)
 ):
-    """Deduct from a vehicle wallet using the wallet_balances table."""
+    """Deduct from a vehicle wallet.
+
+    For additional vehicles, the deduction comes out of the owner's
+    primary plate wallet, matching what the UI shows as the "inherited"
+    balance.
+    """
     try:
-        return deduct_wallet(db, plate_number, amount, session_id, method)
+        plate = plate_number.replace(" ", "").upper()
+
+        target_plate = plate
+        owner_plate = resolve_wallet_owner_plate(db, plate)
+        if owner_plate and owner_plate != plate:
+            target_plate = owner_plate
+            logger.info(f"💸 Deduction for additional vehicle {plate} routed to primary plate wallet {target_plate}")
+
+        result = deduct_wallet(db, target_plate, amount, session_id, method)
+        if isinstance(result, dict):
+            result.setdefault("plate_number", plate)
+            result.setdefault("source_plate", target_plate)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

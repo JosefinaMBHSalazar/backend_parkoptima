@@ -63,7 +63,7 @@ def ensure_tables():
     
     inspector = inspect(engine)
     
-    # Create tables if they don't exist
+    #Create tables if they don't exist
     Base.metadata.create_all(bind=engine)
     logger.info("✅ Tables created/verified")
     

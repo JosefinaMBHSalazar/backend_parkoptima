@@ -68,7 +68,6 @@ def _hourly_values(sessions: Iterable[ParkingSession], days: int = 14) -> Dict[d
 
 # Forecasting feature removed per user request. Historical/summary analytics remain.
 
-
 def build_natural_language_summary(db: Session) -> Dict[str, Any]:
     sessions = db.query(ParkingSession).all()
     paid = [session for session in sessions if session.payment_method]

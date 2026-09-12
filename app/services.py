@@ -46,7 +46,7 @@ def _detect_vehicle_type_with_yolo(image) -> Optional[str]:
             if class_name in {"car", "truck", "bus", "van"}:
                 logger.info(f"YOLO detected: {class_name} -> 4wheels")
                 return "4wheels"
-        
+
         logger.info(f"YOLO detections: {detected_classes}")
         return None
     except Exception as e:
@@ -89,59 +89,83 @@ def get_or_create_owner_profile(db: Session) -> OwnerProfile:
 
 
 def infer_vehicle_type(plate_number: str) -> str:
-    """Infer vehicle type from plate number format."""
+    """Infer vehicle type from plate number format.
+
+    PH plate format rules:
+      • Old 4-wheel plate: 3 letters + 3 digits        → ABC123
+      • Old motor plate:   3 digits + 3 letters        → 123ABC
+      • New 4-wheel plate: 3 letters + 4 digits        → ABC1234
+      • New motor plate:   4 digits + 2 letters        → 0507GQ
+      • New motor plate:   2 letters + 4 digits        → GQ0507
+      • Motor variant:     1 letter + 3 digits + 2 letters → D434SA
+    """
     cleaned = plate_number.replace("-", "").replace(" ", "").upper()
     if not cleaned:
         return "motor"
-    
-    # Check if it's a motorcycle plate (4 digits + 2 letters)
-    # e.g., 0507GQ, 1234AB, 5030HB
-    if len(cleaned) >= 6 and cleaned[:4].isdigit() and cleaned[4:].isalpha() and len(cleaned[4:]) == 2:
-        logger.info(f"Detected motorcycle plate format (digits + letters): {cleaned}")
+
+    # ── 1 letter + 3 digits + 2 letters → MOTOR VARIANT ──
+    # e.g. D434SA, M123AB — must be checked BEFORE the 3L+3D case
+    if (
+        len(cleaned) == 6
+        and cleaned[0].isalpha()
+        and cleaned[1:4].isdigit()
+        and cleaned[4:].isalpha()
+    ):
+        logger.info(f"Detected motor plate format (1L+3D+2L): {cleaned}")
         return "motor"
-    
-    # Check if it's a motorcycle plate (2 letters + 4 digits)
-    # e.g., AB1234, GQ0507, HB5030
-    if len(cleaned) >= 6 and cleaned[:2].isalpha() and cleaned[2:].isdigit() and len(cleaned[2:]) == 4:
-        logger.info(f"Detected motorcycle plate format (letters + digits): {cleaned}")
+
+    # ── 3 letters + 3 digits, letters FIRST → OLD 4-WHEEL PLATE ──
+    if len(cleaned) == 6 and cleaned[:3].isalpha() and cleaned[3:].isdigit():
+        logger.info(f"Detected old 4-wheel plate format (3 letters + 3 digits): {cleaned}")
+        return "4wheels"
+
+    # ── 3 digits + 3 letters, digits FIRST → OLD MOTOR PLATE ──
+    if len(cleaned) == 6 and cleaned[:3].isdigit() and cleaned[3:].isalpha():
+        logger.info(f"Detected old motor plate format (3 digits + 3 letters): {cleaned}")
         return "motor"
-    
-    # Check if it's a motorcycle plate (3 letters + 3 digits)
-    # e.g., ABC123, 943EZQ, DSA434, ZMC445
-    if len(cleaned) >= 6 and cleaned[:3].isalpha() and cleaned[3:].isdigit() and len(cleaned[3:]) == 3:
-        logger.info(f"Detected motorcycle plate format (3+3): {cleaned}")
+
+    # ── 4 digits + 2 letters → motor (e.g. 0507GQ) ──
+    if len(cleaned) == 6 and cleaned[:4].isdigit() and cleaned[4:].isalpha():
+        logger.info(f"Detected motorcycle plate format (4 digits + 2 letters): {cleaned}")
         return "motor"
-    
-    # Check if it starts with a number (likely 4 wheels)
+
+    # ── 2 letters + 4 digits → motor (e.g. GQ0507) ──
+    if len(cleaned) == 6 and cleaned[:2].isalpha() and cleaned[2:].isdigit():
+        logger.info(f"Detected motorcycle plate format (2 letters + 4 digits): {cleaned}")
+        return "motor"
+
+    # ── 3 letters + 4 digits → 4-wheel (e.g. ABC1234) ──
+    if len(cleaned) == 7 and cleaned[:3].isalpha() and cleaned[3:].isdigit():
+        logger.info(f"Detected 4-wheel plate format (3 letters + 4 digits): {cleaned}")
+        return "4wheels"
+
+    # ── 4 digits + 3 letters → uncommon motor variant ──
+    if len(cleaned) == 7 and cleaned[:4].isdigit() and cleaned[4:].isalpha():
+        logger.info(f"Detected motor plate format (4 digits + 3 letters): {cleaned}")
+        return "motor"
+
+    # ── Fallback ──
     if cleaned[0].isdigit():
-        return "4wheels"
-    
-    # If it has 3 letters and 4 digits, it's likely 4 wheels
-    if len(cleaned) >= 7 and cleaned[:3].isalpha() and cleaned[3:].isdigit() and len(cleaned[3:]) == 4:
-        return "4wheels"
-    
-    # Default to motor
-    return "motor"
+        return "motor"
+    return "4wheels"
 
 
 def get_vehicle_type_from_db(db: Session, plate_number: str) -> Optional[str]:
     """Check if the plate is registered in the database and return its vehicle type."""
     normalized_plate = plate_number.replace(" ", "").replace("-", "").upper()
-    
-    # Check in users table first
+
     user = db.query(User).filter(User.plate_number == normalized_plate).first()
     if user and user.vehicle_type:
         logger.info(f"Found vehicle type in users table for {normalized_plate}: {user.vehicle_type}")
         return user.vehicle_type
-    
-    # Check in vehicle_registrations table
+
     registration = db.query(VehicleRegistration).filter(
         VehicleRegistration.plate_number == normalized_plate
     ).first()
     if registration and registration.vehicle_type:
         logger.info(f"Found vehicle type in vehicle_registrations for {normalized_plate}: {registration.vehicle_type}")
         return registration.vehicle_type
-    
+
     return None
 
 
@@ -168,177 +192,237 @@ def _looks_like_plate(text: str):
     """Return a normalized plate string if `text` resembles a PH plate, else None."""
     if not text:
         return None
-    
+
     # Clean the text - remove spaces, dashes, underscores, brackets, etc.
     cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
-    
+
     if not cleaned:
         return None
-    
+
     logger.info(f"Checking plate pattern for: '{cleaned}'")
-    
-    # ── FIX: Remove stray characters that are likely OCR errors ──
-    # Common OCR confusions that create extra characters
-    # If there's a stray 'i' or 'I' between letters and digits, remove it
-    # e.g., ZMCi445 -> ZMC445 (remove 'i')
-    # e.g., ABCi123 -> ABC123 (remove 'i')
-    
-    # First, try to detect if there's a pattern like 3 letters + 1 extra char + 3 digits
-    # or 3 letters + 1 extra char + 4 digits
+
+    # ── Remove stray characters that are likely OCR errors ──
     cleaned_original = cleaned
-    
-    # Check if we have letters, then a single extra char, then digits
+
     match = re.match(r"^([A-Z]{3})[^A-Z0-9]?([A-Z]?)(\d{3,4})$", cleaned)
     if match:
         letters_part = match.group(1)
         extra_char = match.group(2) if match.group(2) else ''
         digits_part = match.group(3)
-        
-        # If the extra char is a letter that's not part of the letters part,
-        # and the digits part is 3 or 4 digits
+
         if extra_char and digits_part and len(digits_part) in [3, 4]:
-            # Check if removing the extra char makes a valid plate
             test_cleaned = letters_part + digits_part
             test_letters = ''.join(c for c in test_cleaned if c.isalpha())
             test_digits = ''.join(c for c in test_cleaned if c.isdigit())
-            
+
             if len(test_letters) == 3 and len(test_digits) == 3:
                 cleaned = test_cleaned
                 logger.info(f"✅ Removed stray character '{extra_char}' from '{cleaned_original}' -> '{cleaned}'")
             elif len(test_letters) == 3 and len(test_digits) == 4:
                 cleaned = test_cleaned
                 logger.info(f"✅ Removed stray character '{extra_char}' from '{cleaned_original}' -> '{cleaned}'")
-    
-    # Also try a more general approach: if there are 3 letters, some characters, and 3-4 digits
-    # try to extract just the letters and digits
+
+    # Reconstruct from letters + digits if there are extra characters
     letters = ''.join(c for c in cleaned if c.isalpha())
     digits = ''.join(c for c in cleaned if c.isdigit())
-    
-    # If we have 3 letters and 3-4 digits, but the total length is more than 6-7,
-    # there might be extra characters
+
     if len(letters) == 3 and len(digits) in [3, 4] and len(cleaned) > len(letters) + len(digits):
-        # Try to rebuild the plate with just letters and digits
-        # But preserve the order: if the original had letters first, keep them first
         if cleaned[0].isalpha():
             test_cleaned = letters + digits
         else:
             test_cleaned = digits + letters
-        
-        # Check if this is valid
+
         test_letters = ''.join(c for c in test_cleaned if c.isalpha())
         test_digits = ''.join(c for c in test_cleaned if c.isdigit())
-        
+
         if len(test_letters) == 3 and len(test_digits) == 3:
             cleaned = test_cleaned
             logger.info(f"✅ Reconstructed plate from letters and digits: '{cleaned}'")
         elif len(test_letters) == 3 and len(test_digits) == 4:
             cleaned = test_cleaned
             logger.info(f"✅ Reconstructed plate from letters and digits: '{cleaned}'")
-    
-    # ── FIX: P → D conversion ──
-    if len(cleaned) >= 2 and cleaned[0] == 'P' and cleaned[1].isdigit():
+
+    # ── P → D conversion ──
+    # OCR frequently misreads a leading "D" as "P". When the plate starts
+    # with "P" followed by a digit, assume the "P" is a misread "D" and
+    # convert it if the result looks like a plausible PH plate.
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == 'P'
+        and cleaned[1].isdigit()
+    ):
         test_cleaned = 'D' + cleaned[1:]
-        test_letters = ''.join(c for c in test_cleaned if c.isalpha())
-        test_digits = ''.join(c for c in test_cleaned if c.isdigit())
-        
-        if len(test_letters) == 3 and len(test_digits) == 3:
+
+        if (
+            re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}", test_cleaned) or  # 1L+3D+2L  e.g. D434SA
+            re.fullmatch(r"[A-Z]\d{3}[A-Z]{3}", test_cleaned) or  # 1L+3D+3L
+            re.fullmatch(r"[A-Z]\d{4}[A-Z]", test_cleaned) or     # 1L+4D+1L
+            re.fullmatch(r"[A-Z]{3}\d{3}", test_cleaned) or       # 3L+3D
+            re.fullmatch(r"\d{3}[A-Z]{3}", test_cleaned)          # 3D+3L
+        ):
             cleaned = test_cleaned
-            logger.info(f"✅ Converted P to D (3+3 format): '{cleaned}'")
-    
-    # ── FIX: 0 → D conversion ──
-    if len(cleaned) >= 2 and cleaned[0] == '0' and cleaned[1].isdigit():
+            logger.info(f"✅ Converted P to D (misread leading letter): '{cleaned}'")
+
+    # ── 0 → D conversion ──
+    # OCR frequently misreads a leading "D" as "0". When the plate starts
+    # with "0" followed by a digit, assume the "0" is a misread "D" and
+    # convert it if the result looks like a plausible PH plate.
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == '0'
+        and cleaned[1].isdigit()
+    ):
         test_cleaned = 'D' + cleaned[1:]
-        test_letters = ''.join(c for c in test_cleaned if c.isalpha())
-        test_digits = ''.join(c for c in test_cleaned if c.isdigit())
-        
-        if len(test_letters) == 3 and len(test_digits) == 3:
+
+        if (
+            re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}", test_cleaned) or  # 1L+3D+2L  e.g. D434SA
+            re.fullmatch(r"[A-Z]\d{3}[A-Z]{3}", test_cleaned) or  # 1L+3D+3L
+            re.fullmatch(r"[A-Z]\d{4}[A-Z]", test_cleaned) or     # 1L+4D+1L
+            re.fullmatch(r"[A-Z]{3}\d{3}", test_cleaned) or       # 3L+3D
+            re.fullmatch(r"\d{3}[A-Z]{3}", test_cleaned)          # 3D+3L
+        ):
             cleaned = test_cleaned
-            logger.info(f"✅ Converted 0 to D (3+3 format): '{cleaned}'")
-    
+            logger.info(f"✅ Converted 0 to D (misread leading digit): '{cleaned}'")
+
     # Common OCR confusions
     cleaned = cleaned.replace('O', '0')
     cleaned = cleaned.replace('I', '1')
-    
-    # Remove any remaining non-alphanumeric
+
     cleaned = re.sub(r"[^A-Z0-9]", "", cleaned)
-    
+
     logger.info(f"After OCR correction: '{cleaned}'")
-    
-    # ── CRITICAL: Check if this is a valid plate format preserving original order ──
-    
-    # Count letters and digits
+
+    # ── Validate plate format preserving original order ──
     letters = ''.join(c for c in cleaned if c.isalpha())
     digits = ''.join(c for c in cleaned if c.isdigit())
     total_len = len(cleaned)
-    
+
     logger.info(f"Letters: '{letters}', Digits: '{digits}', Total: {total_len}")
-    
-    # Motor plates: total 6 characters
+
     if total_len == 6:
-        # Check for 3 letters + 3 digits (any order)
-        if len(letters) == 3 and len(digits) == 3:
-            logger.info(f"✅ Valid motor plate (3+3) in original order: {cleaned}")
+        # 1 letter + 3 digits + 2 letters → motor variant (e.g. D434SA)
+        # MUST be checked before 3L+3D so D434SA isn't misread as letters-first
+        if cleaned[0].isalpha() and cleaned[1:4].isdigit() and cleaned[4:].isalpha():
+            logger.info(f"✅ Valid 6-char plate (1L+3D+2L): {cleaned}")
             return cleaned
-        
-        # Check for 4 digits + 2 letters
-        if len(digits) == 4 and len(letters) == 2:
-            logger.info(f"✅ Valid motor plate (4 digits + 2 letters) in original order: {cleaned}")
+        # 3 letters + 3 digits, letters FIRST → old 4-wheel
+        if cleaned[:3].isalpha() and cleaned[3:].isdigit():
+            logger.info(f"✅ Valid 6-char plate (letters first): {cleaned}")
             return cleaned
-        
-        # Check for 2 letters + 4 digits
-        if len(letters) == 2 and len(digits) == 4:
-            logger.info(f"✅ Valid motor plate (2 letters + 4 digits) in original order: {cleaned}")
+        # 3 digits + 3 letters, digits FIRST → old motor
+        if cleaned[:3].isdigit() and cleaned[3:].isalpha():
+            logger.info(f"✅ Valid 6-char plate (digits first): {cleaned}")
             return cleaned
-    
+        # 4 digits + 2 letters → motor
+        if cleaned[:4].isdigit() and cleaned[4:].isalpha():
+            logger.info(f"✅ Valid 6-char plate (4 digits + 2 letters): {cleaned}")
+            return cleaned
+        # 2 letters + 4 digits → motor
+        if cleaned[:2].isalpha() and cleaned[2:].isdigit():
+            logger.info(f"✅ Valid 6-char plate (2 letters + 4 digits): {cleaned}")
+            return cleaned
+
     # 4-wheels plates: total 7 characters
     if total_len == 7:
-        # Check for 3 letters + 4 digits (any order)
-        if len(letters) == 3 and len(digits) == 4:
-            logger.info(f"✅ Valid 4-wheels plate in original order: {cleaned}")
+        if cleaned[:3].isalpha() and cleaned[3:].isdigit():
+            logger.info(f"✅ Valid 4-wheels plate: {cleaned}")
             return cleaned
-    
-    # If we couldn't validate with the original order, try to reorder
+        if cleaned[:4].isdigit() and cleaned[4:].isalpha():
+            logger.info(f"✅ Valid motor plate (4 digits + 3 letters): {cleaned}")
+            return cleaned
+
+    # ── Reorder fallback: reconstruct from letters + digits, preserving order ──
     if letters and digits:
-        # For 4-wheels: 3 letters + 4 digits
-        if len(letters) >= 3 and len(digits) >= 4:
-            # Try to preserve original order
-            if cleaned[0].isalpha():
-                result = f"{letters[:3]}{digits[:4]}"
-            else:
-                result = f"{digits[:4]}{letters[:3]}"
-            logger.info(f"✅ Formed 4-wheels plate: {result}")
+        starts_with_letter = cleaned[0].isalpha()
+
+        if len(letters) == 3 and len(digits) == 3:
+            result = (letters + digits) if starts_with_letter else (digits + letters)
+            logger.info(f"✅ Formed 6-char plate: {result}")
             return result
-        
-        # For Motor: 3 letters + 3 digits (standard format)
-        if len(letters) >= 3 and len(digits) >= 3:
-            # Preserve original order
-            if cleaned[0].isalpha():
-                result = f"{letters[:3]}{digits[:3]}"
-            else:
-                result = f"{digits[:3]}{letters[:3]}"
-            logger.info(f"✅ Formed motor plate (3+3): {result}")
+
+        if len(letters) == 3 and len(digits) == 4:
+            result = (letters + digits) if starts_with_letter else (digits + letters)
+            logger.info(f"✅ Formed 7-char plate: {result}")
             return result
-        
-        # For Motor: 4 digits + 2 letters
-        if len(digits) >= 4 and len(letters) >= 2:
-            if cleaned[0].isdigit():
-                result = f"{digits[:4]}{letters[:2]}"
-            else:
-                result = f"{letters[:2]}{digits[:4]}"
-            logger.info(f"✅ Formed motor plate (4 digits + 2 letters): {result}")
+
+        if len(letters) == 2 and len(digits) == 4:
+            result = (digits + letters) if not starts_with_letter else (letters + digits)
+            logger.info(f"✅ Formed motor plate (2L+4D): {result}")
             return result
-        
-        # For Motor: 2 letters + 4 digits
-        if len(letters) >= 2 and len(digits) >= 4:
-            if cleaned[0].isalpha():
-                result = f"{letters[:2]}{digits[:4]}"
-            else:
-                result = f"{digits[:4]}{letters[:2]}"
-            logger.info(f"✅ Formed motor plate (2 letters + 4 digits): {result}")
+
+        if len(digits) == 4 and len(letters) == 2:
+            result = (digits + letters) if not starts_with_letter else (letters + digits)
+            logger.info(f"✅ Formed motor plate (4D+2L): {result}")
             return result
-    
+
+        if len(digits) == 3 and len(letters) == 3:
+            result = (digits + letters) if not starts_with_letter else (letters + digits)
+            logger.info(f"✅ Formed 6-char plate (3D+3L): {result}")
+            return result
+
     logger.info(f"❌ No pattern matched for: '{cleaned}'")
     return None
+
+
+# Word-boundary-safe keywords (won't match inside other words)
+FOUR_WHEEL_KEYWORDS = {
+    "MATATAG", "MATATAGNA", "REPUBLIKA", "REPUBLIC",
+    "PILIPINAS", "PHILIPPINES", "LTO",
+    # Partial keywords — survive a leading OCR misread (NATATAG → still matches ATATAG)
+    "ATATAG", "EPUBLIK", "EPUBLIC", "PILIPIN",
+}
+MOTOR_KEYWORDS = {
+    "MOTORCYCLE", "MOTOR",
+    # "MC" intentionally removed — too short, matched inside ZMCI445
+}
+
+def _detect_plate_slogan(all_texts):
+    """Look for slogan text near the plate number that indicates whether the
+    plate is a 4-wheel plate or a motorcycle plate.
+
+    Returns "4wheels", "motor", or None if the slogan can't be determined.
+    """
+    if not all_texts:
+        return None
+
+    combined = " ".join((t or "").upper() for t, _ in all_texts)
+    combined_clean = re.sub(r"[^A-Z0-9]+", " ", combined).strip()
+
+    if not combined_clean:
+        return None
+
+    for kw in FOUR_WHEEL_KEYWORDS:
+        if kw in combined_clean:
+            logger.info(f"🪧 Slogan detected: '{kw}' → 4wheels plate")
+            return "4wheels"
+
+    for kw in MOTOR_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", combined_clean):
+            logger.info(f"🪧 Slogan detected: '{kw}' → motor plate")
+            return "motor"
+
+    return None
+
+
+def _estimate_plate_aspect_ratio(detections) -> Optional[float]:
+    """Return the widest bounding box aspect ratio from EasyOCR detections."""
+    if not detections:
+        return None
+    widest = 0.0
+    for det in detections:
+        try:
+            bbox = det[0]
+            xs = [pt[0] for pt in bbox]
+            ys = [pt[1] for pt in bbox]
+            w = max(xs) - min(xs)
+            h = max(ys) - min(ys)
+            if h > 0:
+                ratio = w / h
+                if ratio > widest:
+                    widest = ratio
+        except Exception:
+            continue
+    return widest if widest > 0 else None
 
 
 def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple[str, float, str]:
@@ -347,11 +431,11 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
     ``(plate, confidence, vehicle_type)``.
 
     This does NOT create a session - it only detects the plate.
-    
+
     If db is provided, it will check the database for registered vehicle type.
     """
     logger.info("Analyzing scan image...")
-    
+
     try:
         import cv2
         import numpy as np
@@ -380,13 +464,12 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
     try:
         reader = _get_easyocr_reader()
         np_image = np.asarray(image)
-        # Preprocessing: CLAHE, denoise and sharpen to improve OCR
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
             gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-            blur = cv2.GaussianBlur(gray, (0,0), sigmaX=3)
+            blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
             sharpened = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
             proc_img = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
             logger.debug("OCR preprocessing applied")
@@ -409,18 +492,15 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
         if len(det) >= 2:
             text = str(det[1]).strip()
             conf = float(det[2]) if len(det) > 2 else 0.0
-            # Remove brackets and other special characters
             text = re.sub(r"[\[\]{}()]", "", text)
             if text:
                 all_texts.append((text, conf))
 
     logger.info(f"Collected {len(all_texts)} text detections")
 
-    # Try to find a plate from the detections
     best_plate = None
     best_conf = 0.0
 
-    # First, try each detection individually
     for text, conf in all_texts:
         plate_match = _looks_like_plate(text)
         if plate_match:
@@ -429,23 +509,22 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
                 best_plate = plate_match
                 best_conf = conf
 
-    # If no single detection works, try combining letter and number detections
     if best_plate is None and len(all_texts) >= 2:
         logger.info("Trying to combine separate letter and number detections...")
-        
+
         letter_texts = []
         number_texts = []
-        
+
         for text, conf in all_texts:
             clean_text = re.sub(r"[^A-Z0-9]", "", text.upper())
             clean_text = clean_text.replace('O', '0')
             clean_text = clean_text.replace('I', '1')
             if not clean_text:
                 continue
-                
+
             letter_count = sum(1 for c in clean_text if c.isalpha())
             digit_count = sum(1 for c in clean_text if c.isdigit())
-            
+
             if letter_count > digit_count and letter_count >= 2:
                 letter_texts.append((clean_text, conf))
             elif digit_count > letter_count and digit_count >= 2:
@@ -455,18 +534,15 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
                     letter_texts.append((clean_text, conf))
                 if digit_count >= 2:
                     number_texts.append((clean_text, conf))
-        
+
         logger.info(f"Letter detections: {letter_texts}")
         logger.info(f"Number detections: {number_texts}")
-        
+
         for letter_text, letter_conf in letter_texts:
             for number_text, number_conf in number_texts:
-                # Try both orders: letters+digits and digits+letters
                 for combined in [letter_text + number_text, number_text + letter_text]:
                     avg_conf = (letter_conf + number_conf) / 2
-                    
                     logger.info(f"Testing combination: '{combined}' (avg conf: {avg_conf})")
-                    
                     plate_match = _looks_like_plate(combined)
                     if plate_match:
                         logger.info(f"✅ Found plate from combination: '{plate_match}' (conf: {avg_conf})")
@@ -477,13 +553,12 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
                 if best_plate:
                     break
 
-    # If still no plate, use aggressive fallback
     if best_plate is None and all_texts:
         logger.info("No plate pattern found, trying aggressive fallback...")
-        
+
         all_letters = ''
         all_digits = ''
-        
+
         for text, conf in all_texts:
             clean_text = re.sub(r"[^A-Z0-9]", "", text.upper())
             clean_text = clean_text.replace('O', '0')
@@ -492,63 +567,100 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
             digits = ''.join(c for c in clean_text if c.isdigit())
             all_letters += letters
             all_digits += digits
-        
+
         logger.info(f"All letters: '{all_letters}', All digits: '{all_digits}'")
-        
+
         if all_letters and all_digits:
-            # Try various combinations
             combinations = []
-            
-            # 3 letters + 4 digits (4-wheels)
+
             if len(all_letters) >= 3 and len(all_digits) >= 4:
                 combinations.append((f"{all_letters[:3]}{all_digits[:4]}", 0.5))
-            
-            # 3 letters + 3 digits (motor standard)
+
             if len(all_letters) >= 3 and len(all_digits) >= 3:
                 combinations.append((f"{all_letters[:3]}{all_digits[:3]}", 0.5))
-            
-            # 2 letters + 4 digits (motor special)
+
             if len(all_letters) >= 2 and len(all_digits) >= 4:
                 combinations.append((f"{all_letters[:2]}{all_digits[:4]}", 0.5))
-                # Also try digits first (e.g., 0507GQ)
                 combinations.append((f"{all_digits[:4]}{all_letters[:2]}", 0.5))
-            
-            # 4 digits + 2 letters (motor special)
+
             if len(all_digits) >= 4 and len(all_letters) >= 2:
                 combinations.append((f"{all_digits[:4]}{all_letters[:2]}", 0.5))
-            
+
             if combinations:
-                # Use the first valid combination
                 best_plate, best_conf = combinations[0]
                 logger.info(f"Using aggressive fallback: '{best_plate}'")
 
-    # Final fallback
     if best_plate is None:
         logger.warning("No plate found, using default")
         return "ABC1234", 0.82, "motor"
 
-    # ── UPDATED: Check database for registered vehicle type ──
-    db_vehicle_type = None
+    # ── Priority-ordered vehicle type resolution ──
+    vehicle_type = None
+    type_source = None
+
+    # 1️⃣ Database
     if db:
         db_vehicle_type = get_vehicle_type_from_db(db, best_plate)
         if db_vehicle_type:
-            logger.info(f"✅ Using vehicle type from database: {db_vehicle_type}")
             vehicle_type = db_vehicle_type
-        else:
-            logger.info(f"No database record found for {best_plate}, using YOLO/inferred type")
-            if yolo_vehicle_type:
-                vehicle_type = yolo_vehicle_type
-            else:
-                vehicle_type = infer_vehicle_type(best_plate)
-                logger.info(f"Inferred vehicle type from plate: {vehicle_type}")
-    else:
-        if yolo_vehicle_type:
-            vehicle_type = yolo_vehicle_type
-        else:
-            vehicle_type = infer_vehicle_type(best_plate)
-            logger.info(f"Inferred vehicle type from plate: {vehicle_type}")
+            type_source = "database"
+            logger.info(f"✅ Vehicle type from DATABASE: {vehicle_type}")
 
-    # Normalize confidence to 0..1 (EasyOCR may return 0..100)
+    # 2️⃣ Slogan detection
+    if vehicle_type is None:
+        slogan_type = _detect_plate_slogan(all_texts)
+        if slogan_type:
+            vehicle_type = slogan_type
+            type_source = "slogan"
+            logger.info(f"✅ Vehicle type from SLOGAN: {vehicle_type}")
+
+    # 3️⃣ Aspect ratio — only used as a SUPPORTING signal
+    if vehicle_type is None:
+        aspect = _estimate_plate_aspect_ratio(detections)
+        if aspect is not None:
+            logger.info(f"📐 Widest detection aspect ratio: {aspect:.2f}")
+
+            plate_looks_like_4wheel = (
+                bool(re.fullmatch(r"[A-Z]{3}\d{3}", best_plate)) or
+                bool(re.fullmatch(r"[A-Z]{3}\d{4}", best_plate))
+            )
+
+            plate_looks_like_motor = (
+                bool(re.fullmatch(r"\d{3}[A-Z]{3}", best_plate)) or
+                bool(re.fullmatch(r"\d{4}[A-Z]{2}", best_plate)) or
+                bool(re.fullmatch(r"[A-Z]{2}\d{4}", best_plate)) or
+                bool(re.fullmatch(r"\d{4}[A-Z]{3}", best_plate)) or
+                bool(re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}", best_plate))  # 1L+3D+2L e.g. D434SA
+            )
+
+            if plate_looks_like_motor:
+                logger.info(f"⏭️ Aspect ratio skipped (plate matches motor pattern: {best_plate})")
+            elif plate_looks_like_4wheel and len(detections) >= 2 and aspect >= 2.20:
+                vehicle_type = "4wheels"
+                type_source = "aspect_ratio"
+                logger.info(f"✅ Vehicle type from ASPECT RATIO ({aspect:.2f} ≥ 2.20, {len(detections)} detections): 4wheels")
+            else:
+                reason = (
+                    "too few detections" if len(detections) < 2 else
+                    "ratio below 2.20" if aspect < 2.20 else
+                    "plate pattern unclear"
+                )
+                logger.info(f"⏭️ Aspect ratio skipped ({reason})")
+
+    # 4️⃣ YOLO detection
+    if vehicle_type is None and yolo_vehicle_type:
+        vehicle_type = yolo_vehicle_type
+        type_source = "yolo"
+        logger.info(f"✅ Vehicle type from YOLO: {vehicle_type}")
+
+    # 5️⃣ Plate format heuristic (final fallback)
+    if vehicle_type is None:
+        vehicle_type = infer_vehicle_type(best_plate)
+        type_source = "format_heuristic"
+        logger.info(f"✅ Vehicle type from FORMAT HEURISTIC: {vehicle_type}")
+
+    logger.info(f"🎯 Vehicle type resolved via {type_source}: {vehicle_type}")
+
     try:
         conf_val = float(best_conf)
         if conf_val > 1.0:

@@ -42,8 +42,10 @@ class ParkingSessionBase(BaseModel):
     fee: float = 0.0
     payment_method: Optional[str] = None
     status: str = "parked"
-    slot: Optional[str] = None
     notes: Optional[str] = None
+    plate_type: str = "registered"          
+    entry_method: str = "scan"              
+    created_by: Optional[str] = None
 
 
 class ParkingSessionUpdate(BaseModel):
@@ -52,9 +54,10 @@ class ParkingSessionUpdate(BaseModel):
     fee: Optional[float] = None
     payment_method: Optional[str] = None
     status: Optional[str] = None
-    slot: Optional[str] = None
     notes: Optional[str] = None
     exit_time: Optional[datetime] = None
+    plate_type: Optional[str] = None
+    entry_method: Optional[str] = None
 
 
 class ParkingSessionResponse(ParkingSessionBase):

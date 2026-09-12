@@ -11,6 +11,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class InactiveAccountError(ValueError):
+    """Raised when a user exists but their account is not active.
+
+    Subclasses ValueError so existing callers that catch ValueError still
+    work, but allows the login endpoint to surface a distinct 403 if it
+    wants to.
+    """
+    pass
+
+
 def _verify_password(password: str, password_hash: Optional[str]) -> bool:
     """Verify a password against a bcrypt hash."""
     if not password_hash:
@@ -44,7 +54,16 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
     if user:
         logger.info(f"Found user in users table: {user.email}, role: {user.role}")
         logger.info(f"Password hash: {user.password_hash[:30]}..." if user.password_hash else "No password hash")
-        
+
+        # ── Block non-active accounts (status check BEFORE password check) ──
+        # Legacy rows with missing/empty status are treated as Active.
+        user_status = (user.status or 'Active').strip()
+        if user_status.lower() != 'active':
+            logger.warning(
+                f"🚫 Login blocked for {user.email}: account status is '{user_status}'"
+            )
+            raise InactiveAccountError("account is not active")
+
         if _verify_password(password, user.password_hash):
             logger.info(f"✅ Password verified for user: {user.email}")
             return {
@@ -61,7 +80,7 @@ def authenticate_user(db: Session, email: str, password: str) -> Dict[str, objec
     if profile:
         logger.info(f"Found user in owner_profiles table: {profile.email}")
         logger.info(f"Password hash: {profile.password_hash[:30]}..." if profile.password_hash else "No password hash")
-        
+
         if _verify_password(password, profile.password_hash):
             logger.info(f"✅ Password verified for owner profile: {profile.email}")
             return {
