@@ -51,7 +51,8 @@ class ParkingSession(Base):
     notes = Column(Text, nullable=True)
     plate_type = Column(String(20), nullable=False, default="registered", index=True)   
     entry_method = Column(String(20), nullable=False, default="scan")                    
-    created_by = Column(String(120), nullable=True)                                       
+    created_by = Column(String(120), nullable=True)
+    balance_after = Column(Float, nullable=True)                                       
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 

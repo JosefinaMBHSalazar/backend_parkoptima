@@ -65,7 +65,7 @@ from .services import analyze_scan_image, get_or_create_owner_profile, get_or_cr
 from .analytics_engine import build_natural_language_summary
 import asyncio
 
-from .routes import password_reset
+from .routes import password_reset, receipts
 
 from .auth import ( authenticate_vehicle_owner, authenticate_user, _verify_password, InactiveAccountError,)
 from .pages.ownerdashboard import get_owner_dashboard_data
@@ -172,6 +172,20 @@ def migrate_database():
     except Exception as e:
         logger.warning(f"Could not add parking_sessions columns: {e}")
 
+    # ── parking_sessions: balance_after for receipt snapshots ──
+    try:
+        columns = [c['name'] for c in inspector.get_columns('parking_sessions')]
+        if 'balance_after' not in columns:
+            logger.info("Adding 'balance_after' column to parking_sessions...")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE parking_sessions ADD COLUMN balance_after FLOAT"))
+                conn.commit()
+            logger.info("✅ Added 'balance_after'")
+        else:
+            logger.info("✅ 'balance_after' column already exists in parking_sessions")
+    except Exception as e:
+        logger.warning(f"Could not add parking_sessions.balance_after: {e}")
+
     # ── parking_sessions: drop the deprecated 'slot' column ──
     try:
         columns = [c['name'] for c in inspector.get_columns('parking_sessions')]
@@ -251,6 +265,7 @@ app.add_middleware(
 )
 
 app.include_router(password_reset.router)
+app.include_router(receipts.router)
 
 # ────── Timezone Helper ──────
 MANILA_TZ = pytz.timezone('Asia/Manila')
@@ -286,6 +301,78 @@ def _seed_on_startup() -> None:
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+def _api_normalize_vehicle_type(vehicle_type: Optional[str]) -> str:
+    """Collapse backend ``vehicle_type`` values to the UI vocabulary."""
+    if not vehicle_type:
+        return "motor"
+    vt = vehicle_type.lower()
+    if vt in ("4_wheels", "4wheels", "four_wheel", "4 wheels") or "four" in vt or "4wheel" in vt:
+        return "4wheels"
+    return "motor"
+
+
+def resolve_wallet_owner_plate(db: Session, plate_number: str) -> Optional[str]:
+    """For a given plate, return the plate whose wallet actually holds the
+    balance.
+
+    Resolution order:
+      1. The plate itself, if it's already a primary vehicle in `users`.
+      2. The owner's primary plate, if the plate is in `vehicles` as a
+         non-primary vehicle.
+      3. None — the plate isn't registered anywhere (caller should fall
+         back to creating its own wallet row).
+    """
+    if not plate_number:
+        return None
+    plate = plate_number.replace(" ", "").upper()
+
+    # 1️⃣ Primary vehicle in users table
+    user = db.query(User).filter(User.plate_number == plate).first()
+    if user:
+        return user.plate_number  # its own wallet
+
+    # 2️⃣ Additional vehicle in vehicles table
+    vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
+    if vehicle:
+        # Find the owner
+        owner = db.query(User).filter(User.id == vehicle.user_id).first()
+        if owner and owner.plate_number:
+            return owner.plate_number  # primary plate = source of truth
+        # No primary plate on file — fall through
+    return None
+
+
+def snapshot_session_balance(db: Session, session: ParkingSession) -> None:
+    """Record the wallet balance onto the session row *right now*.
+
+    Call this immediately after a payment (or exit/unpaid confirmation)
+    is committed. Safe to call multiple times — it just overwrites.
+
+    Never raises: a snapshot failure must not break the payment flow.
+    """
+    if session is None:
+        return
+    try:
+        wallet_plate = (
+            resolve_wallet_owner_plate(db, session.plate_number)
+            or session.plate_number
+        )
+        wallet = db.query(WalletBalance).filter(
+            WalletBalance.plate_number == wallet_plate
+        ).first()
+        session.balance_after = float(wallet.balance) if wallet else 0.0
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        logger.info(
+            f"📸 Snapshot: session {session.id} balance_after = {session.balance_after}"
+        )
+    except Exception as e:
+        # Never let a snapshot failure break the payment flow
+        db.rollback()
+        logger.warning(f"Could not snapshot balance for session {session.id}: {e}")
 
 
 @app.get("/owner/profile", response_model=OwnerProfileResponse)
@@ -359,6 +446,10 @@ def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
     db.add(session)
     db.commit()
     db.refresh(session)
+
+    if session.payment_method:
+        snapshot_session_balance(db, session)
+
     # Broadcast session creation to connected WS clients
     try:
         asyncio.create_task(manager.broadcast({
@@ -452,6 +543,10 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
     transaction = PaymentTransaction(session_id=session.id, amount=session.fee, method=payload.method)
     db.add(transaction)
     db.commit()
+
+
+    snapshot_session_balance(db, session)
+
     # Broadcast session update with payment transaction
     try:
         asyncio.create_task(manager.broadcast({
@@ -889,47 +984,9 @@ def vehicle_registration():
 # ──────────────────────────────────────────────────────────────
 # API routes consumed by the React frontend (vite proxies /api → backend)
 # ──────────────────────────────────────────────────────────────
-
-def _api_normalize_vehicle_type(vehicle_type: Optional[str]) -> str:
-    """Collapse backend ``vehicle_type`` values to the UI vocabulary."""
-    if not vehicle_type:
-        return "motor"
-    vt = vehicle_type.lower()
-    if vt in ("4_wheels", "4wheels", "four_wheel", "4 wheels") or "four" in vt or "4wheel" in vt:
-        return "4wheels"
-    return "motor"
-
-
-
-def resolve_wallet_owner_plate(db: Session, plate_number: str) -> Optional[str]:
-    """For a given plate, return the plate whose wallet actually holds the
-    balance.
-
-    Resolution order:
-      1. The plate itself, if it's already a primary vehicle in `users`.
-      2. The owner's primary plate, if the plate is in `vehicles` as a
-         non-primary vehicle.
-      3. None — the plate isn't registered anywhere (caller should fall
-         back to creating its own wallet row).
-    """
-    if not plate_number:
-        return None
-    plate = plate_number.replace(" ", "").upper()
-
-    # 1️⃣ Primary vehicle in users table
-    user = db.query(User).filter(User.plate_number == plate).first()
-    if user:
-        return user.plate_number  # its own wallet
-
-    # 2️⃣ Additional vehicle in vehicles table
-    vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
-    if vehicle:
-        # Find the owner
-        owner = db.query(User).filter(User.id == vehicle.user_id).first()
-        if owner and owner.plate_number:
-            return owner.plate_number  # primary plate = source of truth
-        # No primary plate on file — fall through
-    return None
+# NOTE: `_api_normalize_vehicle_type`, `resolve_wallet_owner_plate`, and
+# `snapshot_session_balance` are now defined near the top of the file so
+# the helpers can call each other without forward references.
 
 
 @app.get("/api/health")
@@ -1025,6 +1082,10 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
     db.commit()
     db.refresh(session)
 
+
+    if session.payment_method:
+        snapshot_session_balance(db, session)
+
     try:
         asyncio.create_task(manager.broadcast({
             'type': 'session_created',
@@ -1093,6 +1154,11 @@ def api_update_session(session_id: int, payload: ParkingSessionUpdate, db: Sessi
     db.add(session)
     db.commit()
     db.refresh(session)
+
+
+    if session.status == "completed" and session.payment_method and session.balance_after is None:
+        snapshot_session_balance(db, session)
+
     return session
 
 
@@ -1123,6 +1189,9 @@ def api_session_payment(session_id: int, payload: PaymentMethodRequest, db: Sess
     transaction = PaymentTransaction(session_id=session.id, amount=session.fee, method=payload.method)
     db.add(transaction)
     db.commit()
+
+    snapshot_session_balance(db, session)
+
     return session
 
 
@@ -1349,7 +1418,6 @@ def api_get_user_by_plate(plate_number: str, db: Session = Depends(get_db)):
             "user_id": vehicle.user_id,
             "is_registered": True,
             "source": "vehicles",
-            # NEW: the owner's PRIMARY plate — this is what the wallet should use
             "owner_plate_number": owner.plate_number if owner else None,
         }
 
@@ -1536,7 +1604,7 @@ def api_wallet_deduct(payload: WalletDeductRequest, db: Session = Depends(get_db
     return account
 
 
-# ── Wallet Balance (new dedicated table) ──────────────────────
+# ── Wallet Balance ──────────────────────
 
 @app.get("/api/wallet-balance/{plate_number}")
 def api_get_wallet_balance(plate_number: str, db: Session = Depends(get_db)):
@@ -1606,6 +1674,21 @@ def api_wallet_balance_top_up(
             logger.info(f"💰 Top-up for additional vehicle {plate} routed to primary plate wallet {target_plate}")
 
         result = top_up_wallet(db, target_plate, amount)
+
+         # ── Audit log: record the top-up ──
+        try:
+            create_audit_log(
+                db,
+                user_id=None,
+                user_email=None,
+                user_role='vehicle_owner',
+                action_type='Top Up',
+                reference_id=plate,
+                details=f"Wallet top-up of ₱{amount:.2f} for {plate}",
+            )
+        except Exception as e:
+            logger.warning(f"Could not write Top Up audit log: {e}")
+            
         # Echo the plate the caller asked about so the UI can display it
         if isinstance(result, dict):
             result.setdefault("plate_number", plate)
@@ -1623,12 +1706,6 @@ def api_wallet_balance_deduct(
     method: str = "wallet",
     db: Session = Depends(get_db)
 ):
-    """Deduct from a vehicle wallet.
-
-    For additional vehicles, the deduction comes out of the owner's
-    primary plate wallet, matching what the UI shows as the "inherited"
-    balance.
-    """
     try:
         plate = plate_number.replace(" ", "").upper()
 
@@ -1639,6 +1716,21 @@ def api_wallet_balance_deduct(
             logger.info(f"💸 Deduction for additional vehicle {plate} routed to primary plate wallet {target_plate}")
 
         result = deduct_wallet(db, target_plate, amount, session_id, method)
+
+        # ── Snapshot the resulting balance onto the session row ──
+        if session_id:
+            session_row = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
+            if session_row is not None:
+                balance_val = None
+                if isinstance(result, dict):
+                    balance_val = result.get("balance")
+                elif isinstance(result, (int, float)):
+                    balance_val = result
+                if balance_val is not None:
+                    session_row.balance_after = float(balance_val)
+                    db.commit()
+                    logger.info(f"📸 Snapshot: session {session_id} balance_after = {session_row.balance_after}")
+
         if isinstance(result, dict):
             result.setdefault("plate_number", plate)
             result.setdefault("source_plate", target_plate)
