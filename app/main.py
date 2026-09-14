@@ -258,8 +258,11 @@ def validate_signup_credentials(password: str, contact: Optional[str] = None) ->
 # Allow the Vite dev server (and other local frontends) to call the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "https://parkoptima.site",
+        "https://www.parkoptima.site",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
