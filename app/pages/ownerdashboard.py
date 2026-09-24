@@ -4,6 +4,7 @@ from typing import Dict, List
 from sqlalchemy.orm import Session
 
 from ..models import ParkingSession
+from ..analytics_engine import _hourly_values
 
 
 def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
@@ -11,6 +12,12 @@ def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
     paid_sessions = [session for session in sessions if session.payment_method]
     unpaid_sessions = [session for session in sessions if not session.payment_method]
     revenue = round(sum(float(session.fee or 0.0) for session in paid_sessions), 2)
+
+    hourly_raw = _hourly_values(sessions, days=14)
+    hourly_serialized = {
+        k.isoformat() if hasattr(k, "isoformat") else str(k): v
+        for k, v in hourly_raw.items()
+    }
 
     return {
         "total_sessions": len(sessions),
@@ -28,7 +35,6 @@ def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
                 "fee": float(session.fee or 0.0),
                 "payment_method": session.payment_method,
                 "status": session.status,
-                "slot": session.slot,
                 "notes": session.notes,
             }
             for session in sessions

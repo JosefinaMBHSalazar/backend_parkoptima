@@ -16,7 +16,6 @@ def get_live_monitor_data(db: Session) -> Dict[str, object]:
                 "status": session.status,
                 "payment_method": session.payment_method,
                 "fee": float(session.fee or 0.0),
-                "slot": session.slot,
             }
             for session in sessions
         ],

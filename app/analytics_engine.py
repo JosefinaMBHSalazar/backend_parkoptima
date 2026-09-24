@@ -31,7 +31,7 @@ def recommend_slot(db: Session, vehicle_type: str, requested_slot: str | None = 
         db.refresh(settings)
     
     slots = _slot_ids(settings)
-    occupied = {session.slot for session in _active_sessions(db) if session.slot}
+    occupied: set[str] = set()
     if requested_slot:
         normalized = requested_slot.upper()
         if normalized not in slots:

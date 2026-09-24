@@ -258,8 +258,11 @@ def validate_signup_credentials(password: str, contact: Optional[str] = None) ->
 # Allow the Vite dev server (and other local frontends) to call the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "https://parkoptima.site",
+        "https://www.parkoptima.site",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -589,6 +592,7 @@ def owner_overview(db: Session = Depends(get_db)):
     return get_owner_overview_data(db)
 
 
+@app.get("/api/owner/dashboard")
 @app.get("/owner/dashboard")
 def owner_dashboard(db: Session = Depends(get_db)):
     return get_owner_dashboard_data(db)
@@ -620,10 +624,17 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid email or password") from exc
 
+    ROLE_LABELS = {
+        "owner": "Parking Owner",
+        "attendant": "Parking Attendant",
+        "vehicle_owner": "Vehicle Owner",
+    }
+
     if payload.role and payload.role != user["role"]:
+        friendly = ROLE_LABELS.get(payload.role, payload.role)
         raise HTTPException(
             status_code=403,
-            detail=f"This account is not registered as {payload.role}",
+            detail=f"This account is not registered as a {friendly}. Please use the correct login portal.",
         )
 
     return {

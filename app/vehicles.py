@@ -73,7 +73,7 @@ def get_vehicles(db: Session) -> List[Dict[str, object]]:
                 "brand": "—",
                 "model": "",
                 "color": "",
-                "slot": s.slot or "TBD",
+                "slot": "TBD",
                 "status": "Active",
                 "email": "",
                 "contact": "",
