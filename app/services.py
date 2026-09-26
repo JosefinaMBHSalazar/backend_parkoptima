@@ -188,8 +188,125 @@ def _get_easyocr_reader():
     return _EASYOCR_READER
 
 
+# ── LTO plate whitelist ─────────────────────────────────────────
+# Single source of truth for accepted plate formats, kept in sync with
+# sign_up_form.jsx / add_vehicle_form.jsx / scan_vehicle.jsx.
+#
+# Motorcycle (20 patterns):
+#   The 17 current LTO motorcycle formats + 3 legacy formats.
+# 4-Wheels (2 patterns):
+#   ABC123  (old: 3 letters + 3 digits)
+#   ABC1234 (new: 3 letters + 4 digits)
+#
+# NOTE: ABC123 is intentionally NOT a motorcycle format — that shape
+#       belongs to old 4-wheel plates.
+_LTO_WHITELIST_PATTERNS = [
+    # ── Motorcycle ──
+    r"\d[A-Z]{3}\d{2}",         # 1ABC23
+    r"\d{2}[A-Z]{2}\d[A-Z]",    # 12AB3C
+    r"[A-Z]{2}\d[A-Z]\d{2}",    # AB1C23
+    r"\d[A-Z]\d[A-Z]{2}\d",     # 1A2BC3
+    r"[A-Z]\d[A-Z]\d[A-Z]\d",   # A1B2C3
+    r"[A-Z]\d{2}[A-Z]\d[A-Z]",  # A12B3C
+    r"\d[A-Z]{2}\d{2}[A-Z]",    # 1AB23C
+    r"[A-Z]\d[A-Z]{2}\d[A-Z]",  # A1B23C
+    r"[A-Z]{2}\d{2}[A-Z]\d",    # AB12C3
+    r"\d[A-Z]{2}\d[A-Z]\d",     # 1AB2C3
+    r"[A-Z]\d{2}[A-Z]{2}\d",    # A12BC3
+    r"[A-Z]\d[A-Z]\d{3}",       # A1B234
+    r"[A-Z]\d{2}[A-Z]\d{2}",    # A12B34
+    r"[A-Z]\d{3}[A-Z]\d",       # A123B4
+    r"\d{2}[A-Z]{3}\d",         # 12ABC3
+    r"[A-Z]\d[A-Z]{2}\d{2}",    # A1BC23
+    r"[A-Z]\d{3}[A-Z]{2}",      # A123BC / D479QD
+    r"\d{3}[A-Z]{3}",           # 123ABC
+    r"\d{4}[A-Z]{2}",           # 0507GQ
+    r"[A-Z]{2}\d{4}",           # AB1234
+    # ── 4-Wheels ──
+    r"[A-Z]{3}\d{3}",           # ABC123
+    r"[A-Z]{3}\d{4}",           # ABC1234
+]
+
+_LTO_WHITELIST_RE = re.compile(r"(" + "|".join(_LTO_WHITELIST_PATTERNS) + r")$")
+
+
+# OCR ambiguity table: for each commonly-confused character, list the
+# plausible alternatives (itself first, then the alternatives most likely
+# to be the intended character).
+_AMBIGUOUS_OCR_MAP = {
+    # Leading 0 is almost always a misread D on PH plates. Try D first.
+    '0': ['D', '0', 'O'],
+    'O': ['D', 'O', '0'],
+    'D': ['D', '0'],
+    'P': ['P', 'D'],
+    '1': ['1', 'I', 'L'],
+    'I': ['I', '1', 'L'],
+    'L': ['L', '1', 'I'],
+    # S/5 and B/8 confusions are common in LPR too.
+    'S': ['S', '5'],
+    '5': ['5', 'S'],
+    'B': ['B', '8'],
+    '8': ['8', 'B'],
+}
+
+
+def _resolve_ocr_ambiguities(s: str) -> str:
+    """Resolve OCR ambiguity against the LTO whitelist.
+
+    Strategy:
+      1. If the original string already matches the whitelist, return it —
+         EXCEPT when it starts with a leading '0' or 'P' before another
+         digit, which is a strong misread-'D' signal (e.g. 0434SA → D434SA).
+      2. Otherwise, search substitution combinations in order of increasing
+         edit count. Return the first whitelist-valid candidate with the
+         fewest substitutions. This preserves interior digits (5030HB stays
+         5030HB, not 5D3DH8) while still fixing single-character errors
+         (5030H8 → 5030HB, D479Q0 → D479QD).
+    """
+    # ── Stage 1: original already valid ──
+    if _LTO_WHITELIST_RE.fullmatch(s):
+        if len(s) >= 2 and s[0] in ('0', 'P') and s[1].isdigit():
+            candidate = 'D' + s[1:]
+            if _LTO_WHITELIST_RE.fullmatch(candidate):
+                return candidate
+        return s
+
+    # ── Stage 2: minimum-edit search ──
+    positions = [i for i, c in enumerate(s) if c in _AMBIGUOUS_OCR_MAP]
+    if not positions or len(positions) > 6:
+        return s
+
+    import itertools
+
+    # For each position, build the list of alternatives WITHOUT the
+    # original character (we handle "no change" implicitly by tracking
+    # how many positions we actually change).
+    alternatives = {i: [c for c in _AMBIGUOUS_OCR_MAP[s[i]] if c != s[i]] for i in positions}
+
+    # Try increasing edit counts.
+    for k in range(1, len(positions) + 1):
+        for combo_positions in itertools.combinations(positions, k):
+            # Only consider positions where there's at least one alternative.
+            if any(not alternatives[p] for p in combo_positions):
+                continue
+            for combo_chars in itertools.product(*[alternatives[p] for p in combo_positions]):
+                candidate = list(s)
+                for p, c in zip(combo_positions, combo_chars):
+                    candidate[p] = c
+                candidate = ''.join(candidate)
+                if _LTO_WHITELIST_RE.fullmatch(candidate):
+                    return candidate
+
+    return s
+
+
 def _looks_like_plate(text: str):
-    """Return a normalized plate string if `text` resembles a PH plate, else None."""
+    """Return a normalized plate string if `text` resembles a PH plate, else None.
+
+    Acceptance is gated solely by the LTO whitelist (`_LTO_WHITELIST_RE`).
+    OCR-confusion-prone characters are resolved against the same whitelist
+    before the final accept/reject decision.
+    """
     if not text:
         return None
 
@@ -242,126 +359,38 @@ def _looks_like_plate(text: str):
             cleaned = test_cleaned
             logger.info(f"✅ Reconstructed plate from letters and digits: '{cleaned}'")
 
-    # ── P → D conversion ──
-    # OCR frequently misreads a leading "D" as "P". When the plate starts
-    # with "P" followed by a digit, assume the "P" is a misread "D" and
-    # convert it if the result looks like a plausible PH plate.
-    if (
-        len(cleaned) >= 2
-        and cleaned[0] == 'P'
-        and cleaned[1].isdigit()
-    ):
-        test_cleaned = 'D' + cleaned[1:]
-
-        if (
-            re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}", test_cleaned) or  # 1L+3D+2L  e.g. D434SA
-            re.fullmatch(r"[A-Z]\d{3}[A-Z]{3}", test_cleaned) or  # 1L+3D+3L
-            re.fullmatch(r"[A-Z]\d{4}[A-Z]", test_cleaned) or     # 1L+4D+1L
-            re.fullmatch(r"[A-Z]{3}\d{3}", test_cleaned) or       # 3L+3D
-            re.fullmatch(r"\d{3}[A-Z]{3}", test_cleaned)          # 3D+3L
-        ):
-            cleaned = test_cleaned
-            logger.info(f"✅ Converted P to D (misread leading letter): '{cleaned}'")
-
-    # ── 0 → D conversion ──
-    # OCR frequently misreads a leading "D" as "0". When the plate starts
-    # with "0" followed by a digit, assume the "0" is a misread "D" and
-    # convert it if the result looks like a plausible PH plate.
-    if (
-        len(cleaned) >= 2
-        and cleaned[0] == '0'
-        and cleaned[1].isdigit()
-    ):
-        test_cleaned = 'D' + cleaned[1:]
-
-        if (
-            re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}", test_cleaned) or  # 1L+3D+2L  e.g. D434SA
-            re.fullmatch(r"[A-Z]\d{3}[A-Z]{3}", test_cleaned) or  # 1L+3D+3L
-            re.fullmatch(r"[A-Z]\d{4}[A-Z]", test_cleaned) or     # 1L+4D+1L
-            re.fullmatch(r"[A-Z]{3}\d{3}", test_cleaned) or       # 3L+3D
-            re.fullmatch(r"\d{3}[A-Z]{3}", test_cleaned)          # 3D+3L
-        ):
-            cleaned = test_cleaned
-            logger.info(f"✅ Converted 0 to D (misread leading digit): '{cleaned}'")
-
-    # Common OCR confusions
+    # ── Common OCR character substitutions ──
+    # (O→0 and I→1 first; the ambiguity resolver below may flip them back
+    # to letters if a whitelist pattern emerges.)
     cleaned = cleaned.replace('O', '0')
     cleaned = cleaned.replace('I', '1')
 
     cleaned = re.sub(r"[^A-Z0-9]", "", cleaned)
 
+    logger.info(f"Before ambiguity resolution: '{cleaned}'")
+
+    # ── Ambiguity resolution by whitelist matching ──
+    # For each ambiguous character (0/O/D, 1/I/L, P/D), try every plausible
+    # substitution and pick the first combination that matches an LTO
+    # whitelist pattern. Handles cases like:
+    #   D479Q0  → D479QD   (trailing 0 should be D)
+    #   P434SA  → D434SA   (leading P should be D)
+    #   0Q507D  → DQ507D   (leading 0 should be D)
+    # If no combination matches, the original string is returned unchanged.
+    _resolved = _resolve_ocr_ambiguities(cleaned)
+    if _resolved != cleaned:
+        logger.info(f"✅ Ambiguity resolved by whitelist match: '{cleaned}' → '{_resolved}'")
+        cleaned = _resolved
+
     logger.info(f"After OCR correction: '{cleaned}'")
 
-    # ── Validate plate format preserving original order ──
-    letters = ''.join(c for c in cleaned if c.isalpha())
-    digits = ''.join(c for c in cleaned if c.isdigit())
-    total_len = len(cleaned)
+    # ── Final acceptance gate: the whitelist is the sole authority ──
+    if not _LTO_WHITELIST_RE.fullmatch(cleaned):
+        logger.info(f"❌ '{cleaned}' does not match any LTO whitelist pattern — rejecting.")
+        return None
 
-    logger.info(f"Letters: '{letters}', Digits: '{digits}', Total: {total_len}")
-
-    if total_len == 6:
-        # 1 letter + 3 digits + 2 letters → motor variant (e.g. D434SA)
-        # MUST be checked before 3L+3D so D434SA isn't misread as letters-first
-        if cleaned[0].isalpha() and cleaned[1:4].isdigit() and cleaned[4:].isalpha():
-            logger.info(f"✅ Valid 6-char plate (1L+3D+2L): {cleaned}")
-            return cleaned
-        # 3 letters + 3 digits, letters FIRST → old 4-wheel
-        if cleaned[:3].isalpha() and cleaned[3:].isdigit():
-            logger.info(f"✅ Valid 6-char plate (letters first): {cleaned}")
-            return cleaned
-        # 3 digits + 3 letters, digits FIRST → old motor
-        if cleaned[:3].isdigit() and cleaned[3:].isalpha():
-            logger.info(f"✅ Valid 6-char plate (digits first): {cleaned}")
-            return cleaned
-        # 4 digits + 2 letters → motor
-        if cleaned[:4].isdigit() and cleaned[4:].isalpha():
-            logger.info(f"✅ Valid 6-char plate (4 digits + 2 letters): {cleaned}")
-            return cleaned
-        # 2 letters + 4 digits → motor
-        if cleaned[:2].isalpha() and cleaned[2:].isdigit():
-            logger.info(f"✅ Valid 6-char plate (2 letters + 4 digits): {cleaned}")
-            return cleaned
-
-    # 4-wheels plates: total 7 characters
-    if total_len == 7:
-        if cleaned[:3].isalpha() and cleaned[3:].isdigit():
-            logger.info(f"✅ Valid 4-wheels plate: {cleaned}")
-            return cleaned
-        if cleaned[:4].isdigit() and cleaned[4:].isalpha():
-            logger.info(f"✅ Valid motor plate (4 digits + 3 letters): {cleaned}")
-            return cleaned
-
-    # ── Reorder fallback: reconstruct from letters + digits, preserving order ──
-    if letters and digits:
-        starts_with_letter = cleaned[0].isalpha()
-
-        if len(letters) == 3 and len(digits) == 3:
-            result = (letters + digits) if starts_with_letter else (digits + letters)
-            logger.info(f"✅ Formed 6-char plate: {result}")
-            return result
-
-        if len(letters) == 3 and len(digits) == 4:
-            result = (letters + digits) if starts_with_letter else (digits + letters)
-            logger.info(f"✅ Formed 7-char plate: {result}")
-            return result
-
-        if len(letters) == 2 and len(digits) == 4:
-            result = (digits + letters) if not starts_with_letter else (letters + digits)
-            logger.info(f"✅ Formed motor plate (2L+4D): {result}")
-            return result
-
-        if len(digits) == 4 and len(letters) == 2:
-            result = (digits + letters) if not starts_with_letter else (letters + digits)
-            logger.info(f"✅ Formed motor plate (4D+2L): {result}")
-            return result
-
-        if len(digits) == 3 and len(letters) == 3:
-            result = (digits + letters) if not starts_with_letter else (letters + digits)
-            logger.info(f"✅ Formed 6-char plate (3D+3L): {result}")
-            return result
-
-    logger.info(f"❌ No pattern matched for: '{cleaned}'")
-    return None
+    logger.info(f"✅ Plate matches LTO whitelist: {cleaned}")
+    return cleaned
 
 
 # Word-boundary-safe keywords (won't match inside other words)
@@ -586,9 +615,14 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
             if len(all_digits) >= 4 and len(all_letters) >= 2:
                 combinations.append((f"{all_digits[:4]}{all_letters[:2]}", 0.5))
 
-            if combinations:
-                best_plate, best_conf = combinations[0]
-                logger.info(f"Using aggressive fallback: '{best_plate}'")
+            # Only accept the fallback candidate if it passes the whitelist.
+            for candidate, cand_conf in combinations:
+                if _LTO_WHITELIST_RE.fullmatch(candidate):
+                    best_plate, best_conf = candidate, cand_conf
+                    logger.info(f"Using aggressive fallback (whitelist-accepted): '{best_plate}'")
+                    break
+            else:
+                logger.info("Aggressive fallback produced no whitelist-valid candidate.")
 
     if best_plate is None:
         logger.warning("No plate found, using default")

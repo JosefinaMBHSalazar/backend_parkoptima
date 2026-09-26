@@ -1,9 +1,10 @@
 ﻿import os
+import secrets
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import re
 from typing import List, Optional
 
@@ -14,9 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session 
 from sqlalchemy import inspect, text
 
+from pydantic import BaseModel
 from .database import Base, SessionLocal, engine, get_db
 from .models import (
     AuditLog,
+    OTPCode,
     OwnerProfile,
     ParkingSession,
     PaymentTransaction,
@@ -104,6 +107,8 @@ from .pages.wallet import (
 from .pages.vehicle_dashboard import get_vehicle_dashboard_data
 from .pages.vehicle_owner_portal import get_vehicle_owner_portal_data
 from .pages.vehicle_registration import get_vehicle_registration_data
+from .schemas import VehicleCreate, VehicleListItem
+
 import logging
 
 # Set up logging
@@ -200,6 +205,35 @@ def migrate_database():
     except Exception as e:
         logger.warning(f"Could not drop parking_sessions.slot: {e}")
 
+    # ── users: otp_verified column ──
+    try:
+        columns = [c['name'] for c in inspector.get_columns('users')]
+        with engine.connect() as conn:
+            if 'otp_verified' not in columns:
+                logger.info("Adding 'otp_verified' to users...")
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN otp_verified BOOLEAN NOT NULL DEFAULT FALSE"
+                ))
+                # Mark all existing accounts as already verified so they skip OTP
+                conn.execute(text("UPDATE users SET otp_verified = TRUE"))
+                conn.commit()
+                logger.info("✅ Added otp_verified (existing users marked verified)")
+            else:
+                logger.info("✅ 'otp_verified' already exists in users")
+    except Exception as e:
+        logger.warning(f"Could not add users.otp_verified: {e}")
+
+    # ── otp_codes table ──
+    try:
+        if 'otp_codes' not in inspector.get_table_names():
+            logger.info("Creating 'otp_codes' table...")
+            Base.metadata.create_all(bind=engine)
+            logger.info("✅ 'otp_codes' table created")
+        else:
+            logger.info("✅ 'otp_codes' table already exists")
+    except Exception as e:
+        logger.warning(f"Could not create otp_codes table: {e}")
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ParkOptima Owner Backend", version="1.0.0")
@@ -261,6 +295,8 @@ app.add_middleware(
     allow_origins=[
         "https://parkoptima.site",
         "https://www.parkoptima.site",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -288,6 +324,11 @@ def convert_to_manila(dt):
     if dt.tzinfo is None:
         dt = pytz.UTC.localize(dt)
     return dt.astimezone(MANILA_TZ)
+
+# ────── OTP configuration ──────
+OTP_TTL_MINUTES = 10
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN_SECONDS = 60
 
 @app.on_event("startup")
 def _seed_on_startup() -> None:
@@ -377,6 +418,39 @@ def snapshot_session_balance(db: Session, session: ParkingSession) -> None:
         db.rollback()
         logger.warning(f"Could not snapshot balance for session {session.id}: {e}")
 
+# ────── OTP helpers ──────
+def _generate_otp() -> str:
+    """Return a cryptographically random 6-digit code (as string)."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _issue_otp(db: Session, user: User) -> None:
+    """Generate a fresh OTP for the user, store its hash, and (for now) log it.
+
+    Later this will call send_otp_email(); for now, prints to the server console
+    so we can test without SMTP.
+    """
+    code = _generate_otp()
+
+    # Invalidate any prior unused codes for this email
+    db.query(OTPCode).filter(
+        OTPCode.email == user.email,
+        OTPCode.used == False,
+    ).update({"used": True})
+
+    entry = OTPCode(
+        email=user.email,
+        code_hash=bcrypt.hashpw(code.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
+        attempts=0,
+        used=False,
+    )
+    db.add(entry)
+    db.commit()
+
+    from .email_service import send_otp_email
+    logger.info(f"🔐 Issuing OTP for {user.email}")
+    send_otp_email(user.email, code)
 
 @app.get("/owner/profile", response_model=OwnerProfileResponse)
 def get_owner_profile(db: Session = Depends(get_db)):
@@ -615,8 +689,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     try:
         user = authenticate_user(db, payload.email, payload.password)
     except InactiveAccountError as exc:
-        # Distinct 403 so the user knows their account is disabled,
-        # instead of the generic "invalid credentials" 401.
         raise HTTPException(
             status_code=403,
             detail="Your account has been deactivated. Please contact the owner.",
@@ -637,11 +709,164 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             detail=f"This account is not registered as a {friendly}. Please use the correct login portal.",
         )
 
+    # ── OTP gate: only for unverified vehicle owners on their very first login ──
+    db_user = db.query(User).filter(User.id == user["id"]).first()
+    if db_user and db_user.role == "vehicle_owner" and not db_user.otp_verified:
+        now = datetime.utcnow()
+        active = db.query(OTPCode).filter(
+            OTPCode.email == db_user.email,
+            OTPCode.used == False,
+        ).order_by(OTPCode.id.desc()).first()
+
+        active_is_fresh = False
+        if active is not None and active.expires_at is not None:
+            expires = active.expires_at
+            if expires.tzinfo is not None:
+                expires = expires.astimezone(pytz.UTC).replace(tzinfo=None)
+            active_is_fresh = expires > now
+
+        if not active_is_fresh:
+            _issue_otp(db, db_user)
+
+        return {
+            "status": "otp_required",
+            "email": db_user.email,
+            "message": "A verification code has been sent to your email.",
+        }
+
     return {
         "message": "Login successful",
         "user": user,
         "token": f"parkoptima-{user['role']}-{user['id']}",
     }
+
+
+class VerifyOTPRequest(BaseModel):
+    email: str
+    code: str
+
+
+class ResendOTPRequest(BaseModel):
+    email: str
+
+
+@app.post("/auth/verify-otp")
+def verify_otp(payload: VerifyOTPRequest, db: Session = Depends(get_db)):
+    """Verify a first-login OTP and return the full login payload on success."""
+    normalized_email = payload.email.strip().lower()
+
+    user = db.query(User).filter(User.email == normalized_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if user.otp_verified:
+        raise HTTPException(status_code=400, detail="Account already verified. Please log in normally.")
+
+    otp_row = db.query(OTPCode).filter(
+        OTPCode.email == normalized_email,
+        OTPCode.used == False,
+    ).order_by(OTPCode.id.desc()).first()
+
+    if not otp_row:
+        raise HTTPException(status_code=400, detail="No active code. Please request a new one.")
+
+    # ── Expiry check (defensive: handle both naive and aware timestamps) ──
+    # `expires_at` is written by Python as naive UTC. But if a row ever comes
+    # back timezone-aware (or is malformed), we normalize before comparing.
+    expires = otp_row.expires_at
+    if expires is not None and expires.tzinfo is not None:
+        expires = expires.astimezone(pytz.UTC).replace(tzinfo=None)
+    if expires is None or datetime.utcnow() > expires:
+        otp_row.used = True
+        db.commit()
+        raise HTTPException(status_code=400, detail="Code expired. Please request a new one.")
+
+    if (otp_row.attempts or 0) >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many attempts. Please request a new code.")
+
+    if not bcrypt.checkpw(payload.code.encode("utf-8"), otp_row.code_hash.encode("utf-8")):
+        otp_row.attempts = (otp_row.attempts or 0) + 1
+        db.commit()
+        remaining = OTP_MAX_ATTEMPTS - otp_row.attempts
+        raise HTTPException(status_code=401, detail=f"Incorrect code. {remaining} attempt(s) remaining.")
+
+    # Success
+    otp_row.used = True
+    user.otp_verified = True
+    db.add(otp_row)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    try:
+        create_audit_log(
+            db,
+            user_id=str(user.id),
+            user_email=user.email,
+            user_role=user.role,
+            action_type="Account Verified",
+            reference_id=user.email,
+            details="OTP verified on first login",
+        )
+    except Exception as e:
+        logger.warning(f"Could not write Account Verified audit log: {e}")
+
+    ROLE_LABELS = {
+        "owner": "Parking Owner",
+        "attendant": "Parking Attendant",
+        "vehicle_owner": "Vehicle Owner",
+    }
+
+    return {
+        "message": "OTP verified",
+        "user": {
+            "id": user.id,
+            "full_name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+            "role_label": ROLE_LABELS.get(user.role, user.role),
+            "plate_number": user.plate_number,
+            "vehicle_type": user.vehicle_type,
+            "contact": user.contact,
+            "status": user.status,
+        },
+        "token": f"parkoptima-{user.role}-{user.id}",
+    }
+
+
+@app.post("/auth/resend-otp")
+def resend_otp(payload: ResendOTPRequest, db: Session = Depends(get_db)):
+    """Issue a fresh OTP for a first-login account. Rate-limited."""
+    normalized_email = payload.email.strip().lower()
+
+    user = db.query(User).filter(User.email == normalized_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if user.otp_verified:
+        raise HTTPException(status_code=400, detail="Account already verified.")
+
+    last = db.query(OTPCode).filter(
+        OTPCode.email == normalized_email,
+    ).order_by(OTPCode.id.desc()).first()
+
+    if last is not None and last.created_at is not None:
+        created = last.created_at
+        # Legacy rows may be naive local time; treat unknown/mixed values as
+        # "not recently created" rather than trapping the user for hours.
+        if created.tzinfo is not None:
+            created = created.astimezone(pytz.UTC).replace(tzinfo=None)
+        elapsed = (datetime.utcnow() - created).total_seconds()
+        # Only enforce the cooldown for values in the plausible window.
+        if 0 <= elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+            wait = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait}s before requesting a new code.",
+            )
+
+    _issue_otp(db, user)
+    return {"message": "New code sent", "email": normalized_email}
 
 
 # ── Password Management Endpoints ─────────────────────────────
@@ -896,6 +1121,7 @@ def register_user(payload: UserCreate, db: Session = Depends(get_db)) -> UserRes
         brand=payload.brand,
         model=payload.model,
         color=payload.color,
+        otp_verified=(payload.role != "vehicle_owner"),
     )
     db.add(user)
     db.commit()
@@ -931,6 +1157,7 @@ def signup_user(payload: UserCreate, db: Session = Depends(get_db)) -> UserRespo
         email=payload.email,
         password_hash=password_hash,
         role=payload.role,
+        otp_verified=(payload.role != "vehicle_owner"),
     )
     db.add(user)
     db.commit()
@@ -1211,6 +1438,31 @@ def api_session_payment(session_id: int, payload: PaymentMethodRequest, db: Sess
 def api_get_vehicles(db: Session = Depends(get_db)):
     return {"vehicles": get_vehicles(db)}
 
+@app.get("/api/registered-vehicles")
+def api_get_registered_vehicles(db: Session = Depends(get_db)):
+    """Return ONLY the rows from the `vehicles` table (additional vehicles).
+
+    Unlike /api/vehicles, this does NOT merge in parking sessions or users —
+    it's exactly what the Vehicle Registration page needs.
+    """
+    vehicles = db.query(Vehicle).all()
+    return {
+        "vehicles": [
+            {
+                "id": v.id,
+                "user_id": v.user_id,
+                "plate_number": v.plate_number,
+                "vehicle_type": v.vehicle_type,
+                "brand": v.brand,
+                "model": v.model,
+                "color": v.color,
+                "is_primary": v.is_primary,
+                "created_at": v.created_at.isoformat() if v.created_at else None,
+                "updated_at": v.updated_at.isoformat() if v.updated_at else None,
+            }
+            for v in vehicles
+        ]
+    }
 
 # ── Vehicle Management ─────────────────────────────────────────
 
@@ -1366,6 +1618,7 @@ def api_create_user(payload: UserCreate, db: Session = Depends(get_db)):
         brand=payload.brand,
         model=payload.model,
         color=payload.color,
+        otp_verified=(payload.role != "vehicle_owner"),
     )
     db.add(user)
     db.commit()

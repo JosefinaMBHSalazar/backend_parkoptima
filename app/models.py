@@ -27,6 +27,19 @@ class PasswordResetToken(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+
+class OTPCode(Base):
+    __tablename__ = "otp_codes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), index=True, nullable=False)
+    code_hash = Column(String(255), nullable=False)
+    expires_at = Column(DateTime, nullable=False)          
+    attempts = Column(Integer, nullable=False, default=0)
+    used = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)  
+
+
 class SystemSettings(Base):
     __tablename__ = "system_settings"
     id = Column(Integer, primary_key=True, index=True)
@@ -85,6 +98,8 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
     image_url = Column(String(500), nullable=True)
+    otp_verified = Column(Boolean, nullable=False, default=False)
+
 
 class Vehicle(Base):
     __tablename__ = "vehicles"
