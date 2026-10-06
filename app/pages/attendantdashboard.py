@@ -24,7 +24,14 @@ def get_attendant_dashboard_data(db: Session) -> Dict[str, object]:
     active_sessions = [session for session in sessions if session.status == "parked"]
     pending_payments = [session for session in sessions if not session.payment_method]
     revenue_today = round(
-        sum(float(session.fee or 0.0) for session in sessions if session.payment_method and session.entry_time and session.entry_time.date() == today),
+        sum(
+            float(session.fee or 0.0)
+            for session in sessions
+            if session.payment_method
+               and session.payment_method != "reentered"
+               and session.entry_time
+               and session.entry_time.date() == today
+        ),
         2,
     )
 

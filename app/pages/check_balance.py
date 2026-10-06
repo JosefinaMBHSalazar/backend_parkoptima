@@ -5,7 +5,10 @@ from ..models import ParkingSession
 
 def get_check_balance_data(db: Session) -> Dict[str, object]:
     sessions = db.query(ParkingSession).all()
-    paid = [session for session in sessions if session.payment_method]
+    paid = [
+        session for session in sessions
+        if session.payment_method and session.payment_method != "reentered"
+    ]
     return {
         "balance": round(sum(float(session.fee or 0.0) for session in paid), 2),
         "status": "ok",

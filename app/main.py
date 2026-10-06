@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import bcrypt
 import pytz
-from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session 
 from sqlalchemy import inspect, text
@@ -18,7 +18,9 @@ from sqlalchemy import inspect, text
 from pydantic import BaseModel
 from .database import Base, SessionLocal, engine, get_db
 from .models import (
+    Anomaly,
     AuditLog,
+    OccupancyLog,
     OTPCode,
     OwnerProfile,
     ParkingSession,
@@ -108,6 +110,7 @@ from .pages.vehicle_dashboard import get_vehicle_dashboard_data
 from .pages.vehicle_owner_portal import get_vehicle_owner_portal_data
 from .pages.vehicle_registration import get_vehicle_registration_data
 from .schemas import VehicleCreate, VehicleListItem
+from .routes import password_reset, receipts, incidents, anomalies
 
 import logging
 
@@ -191,6 +194,114 @@ def migrate_database():
     except Exception as e:
         logger.warning(f"Could not add parking_sessions.balance_after: {e}")
 
+    # ── parking_sessions: owner_name for entry records ──
+    try:
+        columns = [c['name'] for c in inspector.get_columns('parking_sessions')]
+        if 'owner_name' not in columns:
+            logger.info("Adding 'owner_name' column to parking_sessions...")
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE parking_sessions ADD COLUMN owner_name VARCHAR(100) NULL"))
+                conn.commit()
+            logger.info("✅ Added 'owner_name'")
+        else:
+            logger.info("✅ 'owner_name' column already exists in parking_sessions")
+    except Exception as e:
+        logger.warning(f"Could not add parking_sessions.owner_name: {e}")
+
+    # ── system_settings: per-vehicle-type parking capacity ──
+    try:
+        columns = [c['name'] for c in inspector.get_columns('system_settings')]
+
+        with engine.connect() as conn:
+            if 'motorcycle_capacity' not in columns:
+                logger.info("Adding 'motorcycle_capacity' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN motorcycle_capacity INTEGER NOT NULL DEFAULT 90"
+                ))
+                conn.commit()
+                logger.info("✅ Added motorcycle_capacity")
+
+            if 'four_wheel_capacity' not in columns:
+                logger.info("Adding 'four_wheel_capacity' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN four_wheel_capacity INTEGER NOT NULL DEFAULT 10"
+                ))
+                conn.commit()
+                logger.info("✅ Added four_wheel_capacity")
+
+            # ── NEW: operating hours (minutes since midnight, Asia/Manila) ──
+            if 'operating_open_minutes' not in columns:
+                logger.info("Adding 'operating_open_minutes' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN operating_open_minutes INTEGER NOT NULL DEFAULT 420"
+                ))
+                conn.commit()
+                logger.info("✅ Added operating_open_minutes (07:00 AM)")
+
+            if 'operating_close_minutes' not in columns:
+                logger.info("Adding 'operating_close_minutes' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN operating_close_minutes INTEGER NOT NULL DEFAULT 1020"
+                ))
+                conn.commit()
+                logger.info("✅ Added operating_close_minutes (05:00 PM)")
+
+            # ── Receipt content columns ──
+            if 'receipt_facility_name' not in columns:
+                logger.info("Adding 'receipt_facility_name' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN receipt_facility_name VARCHAR(80) DEFAULT ''"
+                ))
+                conn.commit()
+                logger.info("✅ Added receipt_facility_name")
+
+            if 'receipt_header' not in columns:
+                logger.info("Adding 'receipt_header' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN receipt_header VARCHAR(120) DEFAULT ''"
+                ))
+                conn.commit()
+                logger.info("✅ Added receipt_header")
+
+            if 'receipt_footer' not in columns:
+                logger.info("Adding 'receipt_footer' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN receipt_footer VARCHAR(160) DEFAULT ''"
+                ))
+                conn.commit()
+                logger.info("✅ Added receipt_footer")
+
+            if 'receipt_notes' not in columns:
+                logger.info("Adding 'receipt_notes' to system_settings...")
+                conn.execute(text(
+                    "ALTER TABLE system_settings ADD COLUMN receipt_notes TEXT DEFAULT ''"
+                ))
+                conn.commit()
+                logger.info("✅ Added receipt_notes")
+
+
+            # One-time backfill: if the two new columns are at their defaults
+            # but parking_capacity was customized, split the old total 90/10.
+            try:
+                row = conn.execute(text(
+                    "SELECT id, parking_capacity, motorcycle_capacity, four_wheel_capacity "
+                    "FROM system_settings LIMIT 1"
+                )).fetchone()
+                if row and row[1] and row[1] != 100 and row[2] == 90 and row[3] == 10:
+                    old_cap = int(row[1])
+                    new_moto = max(0, round(old_cap * 0.9))
+                    new_four = max(0, old_cap - new_moto)
+                    conn.execute(text(
+                        "UPDATE system_settings SET motorcycle_capacity = :m, four_wheel_capacity = :f WHERE id = :id"
+                    ), {"m": new_moto, "f": new_four, "id": row[0]})
+                    conn.commit()
+                    logger.info(f"✅ Backfilled capacities: {old_cap} → {new_moto}/{new_four}")
+            except Exception as e:
+                logger.warning(f"Capacity backfill skipped: {e}")
+    except Exception as e:
+        logger.warning(f"Could not add system_settings capacity columns: {e}")
+
+
     # ── parking_sessions: drop the deprecated 'slot' column ──
     try:
         columns = [c['name'] for c in inspector.get_columns('parking_sessions')]
@@ -204,6 +315,19 @@ def migrate_database():
             logger.info("✅ 'slot' column already dropped from parking_sessions")
     except Exception as e:
         logger.warning(f"Could not drop parking_sessions.slot: {e}")
+
+
+    # ── occupancy_logs table ──
+    try:
+        if 'occupancy_logs' not in inspector.get_table_names():
+            logger.info("Creating 'occupancy_logs' table...")
+            Base.metadata.create_all(bind=engine)
+            logger.info("✅ 'occupancy_logs' table created")
+        else:
+            logger.info("✅ 'occupancy_logs' table already exists")
+    except Exception as e:
+        logger.warning(f"Could not create occupancy_logs table: {e}")
+
 
     # ── users: otp_verified column ──
     try:
@@ -283,6 +407,25 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+# ── Periodic occupancy snapshotter ───────────────────────────
+async def periodic_occupancy_snapshot():
+    from .services import snapshot_occupancy
+
+    # Give the app a moment to finish starting up.
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                snapshot_occupancy(db, trigger="periodic")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Periodic occupancy snapshot error: {e}")
+        await asyncio.sleep(5 * 60)  
+
+
 def validate_signup_credentials(password: str, contact: Optional[str] = None) -> None:
     if not re.fullmatch(r"(?=.{6,}$)(?=.*\d)(?=.*[^A-Za-z0-9]).*", password):
         raise HTTPException(status_code=422, detail="Password must have at least 6 characters, 1 number, and 1 special character")
@@ -305,6 +448,8 @@ app.add_middleware(
 
 app.include_router(password_reset.router)
 app.include_router(receipts.router)
+app.include_router(incidents.router)
+app.include_router(anomalies.router)
 
 # ────── Timezone Helper ──────
 MANILA_TZ = pytz.timezone('Asia/Manila')
@@ -340,6 +485,9 @@ def _seed_on_startup() -> None:
         seed_default_accounts(db)
     finally:
         db.close()
+
+    # Kick off the periodic occupancy snapshotter in the background
+    asyncio.create_task(periodic_occupancy_snapshot())
 
 
 @app.get("/health")
@@ -518,13 +666,14 @@ def create_session(payload: ParkingSessionBase, db: Session = Depends(get_db)):
         payment_method=payload.payment_method,
         status=payload.status,
         notes=payload.notes,
+        owner_name=(payload.owner_name or "").strip() or None,
         entry_time=datetime.now(pytz.UTC),
     )
     db.add(session)
     db.commit()
     db.refresh(session)
 
-    if session.payment_method:
+    if session.payment_method and session.payment_method != "reentered":
         snapshot_session_balance(db, session)
 
     # Broadcast session creation to connected WS clients
@@ -565,6 +714,14 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # A "reentered" session is already covered by an earlier payment today.
+    if session.payment_method == "reentered":
+        raise HTTPException(
+            status_code=409,
+            detail="This session is covered by an earlier payment today; no additional charge is due.",
+        )
+
     # Validate fee matches current system settings to avoid wrong charge
     settings = get_or_create_settings(db)
     expected_fee = settings.motor_fee if session.vehicle_type == "motor" else settings.four_wheel_fee
@@ -649,9 +806,11 @@ def update_payment(session_id: int, payload: PaymentMethodRequest, db: Session =
 @app.get("/owner/reports")
 def get_reports(db: Session = Depends(get_db)):
     sessions = db.query(ParkingSession).all()
-    paid = [s for s in sessions if s.payment_method]
+    # A "reentered" session is not a new payment — the plate already
+    # paid earlier today. Exclude it from both counts and revenue.
+    paid = [s for s in sessions if s.payment_method and s.payment_method != "reentered"]
     unpaid = [s for s in sessions if not s.payment_method]
-    revenue = sum(s.fee for s in paid)
+    revenue = sum((s.fee or 0) for s in paid)
     return {
         "total_sessions": len(sessions),
         "paid_sessions": len(paid),
@@ -1296,13 +1455,49 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
     if fee is None or fee == 0:
         fee = settings.motor_fee if vehicle_type == "motor" else settings.four_wheel_fee
 
-    # ── Server-side capacity guard ──
+    # ── Operating hours guard (entry only) ──
+    from .services import is_within_operating_hours
+    is_open, hours_msg = is_within_operating_hours(settings)
+    if not is_open:
+        raise HTTPException(status_code=409, detail=hours_msg)
+
+
+    # ── Server-side capacity guard (per vehicle type) ──
     parked_count = db.query(ParkingSession).filter(ParkingSession.status == "parked").count()
-    if settings.parking_capacity and parked_count >= settings.parking_capacity:
+
+    # Overall capacity check (legacy behavior, still enforced)
+    total_capacity = int(settings.parking_capacity or 0)
+    if total_capacity and parked_count >= total_capacity:
         raise HTTPException(
             status_code=409,
-            detail=f"Facility is full ({parked_count}/{settings.parking_capacity}). Entry blocked."
+            detail=f"Facility is full ({parked_count}/{total_capacity}). Entry blocked."
         )
+
+    # Per-type capacity check (new behavior)
+    if vehicle_type == "motor":
+        moto_cap = int(settings.motorcycle_capacity or 0)
+        if moto_cap:
+            parked_motos = db.query(ParkingSession).filter(
+                ParkingSession.status == "parked",
+                ParkingSession.vehicle_type == "motor"
+            ).count()
+            if parked_motos >= moto_cap:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Motorcycle slots full ({parked_motos}/{moto_cap}). Entry blocked."
+                )
+    else:
+        four_cap = int(settings.four_wheel_capacity or 0)
+        if four_cap:
+            parked_four = db.query(ParkingSession).filter(
+                ParkingSession.status == "parked",
+                ParkingSession.vehicle_type.in_(("4wheels", "4_wheels", "four_wheel"))
+            ).count()
+            if parked_four >= four_cap:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"4-Wheel slots full ({parked_four}/{four_cap}). Entry blocked."
+                )
 
     session = ParkingSession(
         plate_number=plate_number,
@@ -1314,6 +1509,7 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
         plate_type=plate_type,
         entry_method=payload.entry_method or "scan",
         created_by=payload.created_by,
+        owner_name=(payload.owner_name or "").strip() or None,
         entry_time=datetime.now(pytz.UTC),
     )
     db.add(session)
@@ -1321,7 +1517,9 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
     db.refresh(session)
 
 
-    if session.payment_method:
+    # A "reentered" session is covered by an earlier payment today, so
+    # there's no wallet movement to snapshot and no payment to attribute.
+    if session.payment_method and session.payment_method != "reentered":
         snapshot_session_balance(db, session)
 
     try:
@@ -1339,6 +1537,10 @@ def api_create_session(payload: ParkingSessionBase, db: Session = Depends(get_db
         }))
     except Exception:
         pass
+
+    # ── Occupancy snapshot: entry event ──
+    from .services import snapshot_occupancy
+    snapshot_occupancy(db, trigger="entry")
 
     return session
 
@@ -1364,12 +1566,30 @@ def api_get_session(session_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/api/sessions/{session_id}", response_model=ParkingSessionResponse)
-def api_update_session(session_id: int, payload: ParkingSessionUpdate, db: Session = Depends(get_db)):
+def api_update_session(
+    session_id: int,
+    payload: ParkingSessionUpdate,
+    actor_role: Optional[str] = Query(None),
+    actor_email: Optional[str] = Query(None),
+    actor_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.status == "completed":
         raise HTTPException(status_code=409, detail="Completed transactions cannot be edited")
+
+    # ── Capture "before" state for the audit diff ──
+    before = {
+        "plate_number": session.plate_number,
+        "vehicle_type": session.vehicle_type,
+        "fee": session.fee,
+        "payment_method": session.payment_method,
+        "status": session.status,
+        "notes": session.notes,
+        "exit_time": session.exit_time.isoformat() if session.exit_time else None,
+    }
 
     if payload.plate_number is not None:
         session.plate_number = payload.plate_number.upper()
@@ -1393,22 +1613,120 @@ def api_update_session(session_id: int, payload: ParkingSessionUpdate, db: Sessi
     db.commit()
     db.refresh(session)
 
+    # ── Audit trail: transaction edit ──
+    try:
+        after = {
+            "plate_number": session.plate_number,
+            "vehicle_type": session.vehicle_type,
+            "fee": session.fee,
+            "payment_method": session.payment_method,
+            "status": session.status,
+            "notes": session.notes,
+            "exit_time": session.exit_time.isoformat() if session.exit_time else None,
+        }
 
-    if session.status == "completed" and session.payment_method and session.balance_after is None:
+        changes = []
+        for key in before:
+            if before[key] != after[key]:
+                label = key.replace('_', ' ')
+                changes.append(f"{label}: {before[key]!r} → {after[key]!r}")
+
+        detail = (
+            f"Session #{session.id} ({session.plate_number}) edited — "
+            + ("; ".join(changes) if changes else "no fields changed")
+        )
+
+        # Attribute the audit row to the actual actor.
+        create_audit_log(
+            db,
+            user_id=None,
+            user_email=actor_email,
+            user_role=(actor_role or "attendant").lower(),
+            action_type="Edited Transaction",
+            reference_id=str(session.id),
+            details=(
+                f"[{actor_name or actor_email or 'unknown'}] {detail}"
+                if (actor_name or actor_email)
+                else detail
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"Could not write Edited Transaction audit log: {e}")
+
+    if (
+        session.status == "completed"
+        and session.payment_method
+        and session.payment_method != "reentered"
+        and session.balance_after is None
+    ):
         snapshot_session_balance(db, session)
+
+    # ── Occupancy snapshot: exit event (status → completed) ──
+    if session.status == "completed":
+        from .services import snapshot_occupancy
+        snapshot_occupancy(db, trigger="exit")
 
     return session
 
 
 @app.delete("/api/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-def api_delete_session(session_id: int, db: Session = Depends(get_db)):
+def api_delete_session(
+    session_id: int,
+    actor_role: Optional[str] = Query(None),
+    actor_email: Optional[str] = Query(None),
+    actor_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.status == "completed":
         raise HTTPException(status_code=409, detail="Completed transactions cannot be deleted")
+
+    # ── Capture the row's identifying details BEFORE deleting ──
+    deleted_snapshot = {
+        "id": session.id,
+        "plate_number": session.plate_number,
+        "vehicle_type": session.vehicle_type,
+        "fee": session.fee,
+        "payment_method": session.payment_method,
+        "status": session.status,
+        "entry_time": session.entry_time.isoformat() if session.entry_time else None,
+        "exit_time": session.exit_time.isoformat() if session.exit_time else None,
+    }
+
     db.delete(session)
     db.commit()
+
+    # ── Audit trail: transaction deletion ──
+    try:
+        detail = (
+            f"Session #{deleted_snapshot['id']} ({deleted_snapshot['plate_number']}) deleted — "
+            f"type: {deleted_snapshot['vehicle_type']}, "
+            f"fee: ₱{float(deleted_snapshot['fee'] or 0):.2f}, "
+            f"status: {deleted_snapshot['status']}, "
+            f"payment: {deleted_snapshot['payment_method'] or 'unpaid'}"
+        )
+
+        create_audit_log(
+            db,
+            user_id=None,
+            user_email=actor_email,
+            user_role=(actor_role or "attendant").lower(),
+            action_type="Deleted Transaction",
+            reference_id=str(deleted_snapshot["id"]),
+            details=(
+                f"[{actor_name or actor_email or 'unknown'}] {detail}"
+                if (actor_name or actor_email)
+                else detail
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"Could not write Deleted Transaction audit log: {e}")
+
+    # ── Occupancy snapshot: a parked session was removed ──
+    from .services import snapshot_occupancy
+    snapshot_occupancy(db, trigger="status_change")
 
 
 @app.post("/api/sessions/{session_id}/payment", response_model=ParkingSessionResponse)
@@ -1416,7 +1734,15 @@ def api_session_payment(session_id: int, payload: PaymentMethodRequest, db: Sess
     session = db.query(ParkingSession).filter(ParkingSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    # A "reentered" session is already covered by an earlier payment today —
+    # charging it again would double-count revenue for the same plate.
+    if session.payment_method == "reentered":
+        raise HTTPException(
+            status_code=409,
+            detail="This session is covered by an earlier payment today; no additional charge is due.",
+        )
+
     session.payment_method = payload.method
     # Don't change status here - let the exit process handle it
     
@@ -1731,6 +2057,8 @@ def api_get_settings(db: Session = Depends(get_db)):
 
     logger.info(
         f"GET SETTINGS -> id={settings.id}, "
+        f"motorcycle_capacity={settings.motorcycle_capacity}, "
+        f"four_wheel_capacity={settings.four_wheel_capacity}, "
         f"parking_capacity={settings.parking_capacity}"
     )
 
@@ -1746,7 +2074,7 @@ def api_update_settings(
     logger.info(f"Incoming payload: {payload.dict()}")
 
     settings = get_or_create_settings(db)
-    
+
     # Store old values for comparison
     old_capacity = settings.parking_capacity
     logger.info(f"Old parking_capacity: {old_capacity}")
@@ -1755,13 +2083,53 @@ def api_update_settings(
     settings.system_name = payload.system_name
     settings.motor_fee = payload.motor_fee
     settings.four_wheel_fee = payload.four_wheel_fee
-    settings.parking_capacity = payload.parking_capacity
+
+    # Accept per-type capacities if provided (new schema).
+    # Fall back to the legacy `parking_capacity` field otherwise.
+    moto_cap = getattr(payload, "motorcycle_capacity", None)
+    four_cap = getattr(payload, "four_wheel_capacity", None)
+
+    if moto_cap is not None:
+        settings.motorcycle_capacity = int(moto_cap)
+    if four_cap is not None:
+        settings.four_wheel_capacity = int(four_cap)
+
+    # ── Operating hours ──
+    open_min = getattr(payload, "operating_open_minutes", None)
+    close_min = getattr(payload, "operating_close_minutes", None)
+
+    if open_min is not None:
+        settings.operating_open_minutes = max(0, min(int(open_min), 1439))
+    if close_min is not None:
+        settings.operating_close_minutes = max(0, min(int(close_min), 1439))
+
+    # ── Receipt content ──
+    if payload.receipt_facility_name is not None:
+        settings.receipt_facility_name = payload.receipt_facility_name.strip()[:80]
+    if payload.receipt_header is not None:
+        settings.receipt_header = payload.receipt_header.strip()[:120]
+    if payload.receipt_footer is not None:
+        settings.receipt_footer = payload.receipt_footer.strip()[:160]
+    if payload.receipt_notes is not None:
+        settings.receipt_notes = payload.receipt_notes.strip()[:300]
+
+    # Keep the legacy parking_capacity in sync with the sum of the two.
+    settings.parking_capacity = (
+        int(settings.motorcycle_capacity or 0) +
+        int(settings.four_wheel_capacity or 0)
+    )
 
     logger.info(
         f"Saving -> system_name={settings.system_name}, "
         f"motor_fee={settings.motor_fee}, "
         f"four_wheel_fee={settings.four_wheel_fee}, "
-        f"parking_capacity={settings.parking_capacity}"
+        f"motorcycle_capacity={settings.motorcycle_capacity}, "
+        f"four_wheel_capacity={settings.four_wheel_capacity}, "
+        f"parking_capacity={settings.parking_capacity}, "
+        f"receipt_facility_name={settings.receipt_facility_name!r}, "
+        f"receipt_header={settings.receipt_header!r}, "
+        f"receipt_footer={settings.receipt_footer!r}, "
+        f"receipt_notes={settings.receipt_notes!r}"
     )
 
     try:
@@ -2031,3 +2399,174 @@ def api_delete_wallet_balance(plate_number: str, db: Session = Depends(get_db)):
         return {"message": f"Wallet balance for {plate_number} deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ── Occupancy Logs ───────────────────────────────────────────
+@app.get("/api/occupancy-logs")
+def api_get_occupancy_logs(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=5000),
+    db: Session = Depends(get_db),
+):
+    """Raw snapshot list, newest first.
+
+    Used by the owner's occupancy-history view. Each row is a single
+    moment in time, not a per-vehicle event.
+    """
+    q = db.query(OccupancyLog)
+
+    if date_from:
+        try:
+            d = datetime.fromisoformat(date_from).replace(tzinfo=pytz.UTC).replace(tzinfo=None)
+            q = q.filter(OccupancyLog.timestamp >= d)
+        except Exception:
+            pass
+
+    if date_to:
+        try:
+            d = datetime.fromisoformat(date_to).replace(tzinfo=pytz.UTC).replace(tzinfo=None)
+            q = q.filter(OccupancyLog.timestamp <= d)
+        except Exception:
+            pass
+
+    rows = q.order_by(OccupancyLog.timestamp.desc()).limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "motor_occupied": r.motor_occupied,
+            "motor_capacity": r.motor_capacity,
+            "four_wheel_occupied": r.four_wheel_occupied,
+            "four_wheel_capacity": r.four_wheel_capacity,
+            "total_occupied": r.total_occupied,
+            "total_capacity": r.total_capacity,
+            "is_full": r.is_full,
+            "trigger": r.trigger,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/occupancy-logs/hourly")
+def api_get_occupancy_hourly(
+    date: Optional[str] = None,  # "YYYY-MM-DD" in Manila time
+    db: Session = Depends(get_db),
+):
+    """Bucket snapshots by hour and return the peak occupancy per bucket.
+
+    Used by the owner's "Occupancy over time" chart. Returns a flat
+    list of hourly buckets so the frontend can render a line chart
+    directly without client-side aggregation.
+    """
+    target_date = date or datetime.now(MANILA_TZ).strftime("%Y-%m-%d")
+
+    try:
+        day_start_manila = MANILA_TZ.localize(
+            datetime.strptime(target_date, "%Y-%m-%d")
+        )
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid date; use YYYY-MM-DD.")
+
+    day_end_manila = day_start_manila + timedelta(days=1)
+
+    # Convert to naive UTC for comparison against the DB column.
+    start_utc = day_start_manila.astimezone(pytz.UTC).replace(tzinfo=None)
+    end_utc = day_end_manila.astimezone(pytz.UTC).replace(tzinfo=None)
+
+    rows = db.query(OccupancyLog).filter(
+        OccupancyLog.timestamp >= start_utc,
+        OccupancyLog.timestamp <  end_utc,
+    ).order_by(OccupancyLog.timestamp.asc()).all()
+
+    buckets = {}
+    for r in rows:
+        if not r.timestamp:
+            continue
+        ts = r.timestamp
+        if ts.tzinfo is None:
+            ts = pytz.UTC.localize(ts)
+        manila_ts = ts.astimezone(MANILA_TZ)
+        hour = manila_ts.hour
+
+        b = buckets.setdefault(hour, {
+            "hour": hour,
+            "motor_peak": 0,
+            "four_wheel_peak": 0,
+            "total_peak": 0,
+            "snapshots": 0,
+        })
+        b["motor_peak"] = max(b["motor_peak"], r.motor_occupied or 0)
+        b["four_wheel_peak"] = max(b["four_wheel_peak"], r.four_wheel_occupied or 0)
+        b["total_peak"] = max(b["total_peak"], r.total_occupied or 0)
+        b["snapshots"] += 1
+
+    return {
+        "date": target_date,
+        "timezone": "Asia/Manila",
+        "buckets": sorted(buckets.values(), key=lambda x: x["hour"]),
+    }
+
+
+@app.get("/api/sessions/active/{plate_number}", response_model=Optional[ParkingSessionResponse])
+def api_get_active_session(plate_number: str, db: Session = Depends(get_db)):
+    """Return the active session for a plate, or 404 if none."""
+    plate = plate_number.replace(" ", "").upper()
+    session = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate,
+            ParkingSession.status == "parked",
+        )
+        .order_by(ParkingSession.entry_time.desc())
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="No active session")
+    if session.entry_time:
+        session.entry_time = convert_to_manila(session.entry_time)
+    if session.exit_time:
+        session.exit_time = convert_to_manila(session.exit_time)
+    return session
+
+
+@app.get("/api/sessions/paid-today/{plate_number}")
+def api_session_paid_today(plate_number: str, db: Session = Depends(get_db)):
+    """Has this plate already paid for at least one session today (Asia/Manila)?
+
+    Returns the most recent paid session from today so the caller can
+    reuse its payment_method. 404 if none.
+    """
+    plate = plate_number.replace(" ", "").upper()
+
+    # Today's window in Manila time, converted to naive UTC for the DB query.
+    now_manila = datetime.now(MANILA_TZ)
+    day_start_manila = now_manila.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end_manila   = day_start_manila + timedelta(days=1)
+
+    start_utc = day_start_manila.astimezone(pytz.UTC).replace(tzinfo=None)
+    end_utc   = day_end_manila.astimezone(pytz.UTC).replace(tzinfo=None)
+
+    row = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate,
+            ParkingSession.payment_method.isnot(None),
+            ParkingSession.payment_method != "reentered",
+            ParkingSession.entry_time >= start_utc,
+            ParkingSession.entry_time <  end_utc,
+        )
+        .order_by(ParkingSession.entry_time.desc())
+        .first()
+    )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No paid session today")
+
+    return {
+        "plate_number": plate,
+        "session_id": row.id,
+        "payment_method": row.payment_method,
+        "entry_time": row.entry_time.isoformat() if row.entry_time else None,
+        "fee": row.fee,
+    }

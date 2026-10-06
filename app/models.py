@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Text, Boolean
+from sqlalchemy import Column, ForeignKey, Integer, String, DateTime, Float, Text, Boolean
 from sqlalchemy.sql import func
 from datetime import datetime  
 from .database import Base
@@ -46,7 +46,15 @@ class SystemSettings(Base):
     system_name = Column(String(120), nullable=False, default="ParkOptima")
     motor_fee = Column(Float, nullable=False, default=5.0)
     four_wheel_fee = Column(Float, nullable=False, default=20.0)
+    motorcycle_capacity = Column(Integer, nullable=False, default=90)
+    four_wheel_capacity = Column(Integer, nullable=False, default=10)
     parking_capacity = Column(Integer, nullable=False, default=100)
+    operating_open_minutes = Column(Integer, nullable=False, default=420)
+    operating_close_minutes = Column(Integer, nullable=False, default=1020)
+    receipt_facility_name = Column(String(80),  nullable=True, default="")
+    receipt_header        = Column(String(120), nullable=True, default="")
+    receipt_footer        = Column(String(160), nullable=True, default="")
+    receipt_notes         = Column(Text,        nullable=True, default="")
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
@@ -65,6 +73,7 @@ class ParkingSession(Base):
     plate_type = Column(String(20), nullable=False, default="registered", index=True)   
     entry_method = Column(String(20), nullable=False, default="scan")                    
     created_by = Column(String(120), nullable=True)
+    owner_name = Column(String(100), nullable=True)
     balance_after = Column(Float, nullable=True)                                       
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
@@ -172,3 +181,77 @@ class WalletBalance(Base):
     balance = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class IncidentReport(Base):
+    __tablename__ = "incident_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reference_number = Column(String(32), unique=True, index=True, nullable=False)
+
+    # Linked session (the active parking session at the time of reporting)
+    session_id = Column(Integer, nullable=True, index=True)
+    plate_number = Column(String(32), nullable=False, index=True)
+    owner_name = Column(String(120), nullable=True)     
+
+    # Reporter-provided fields
+    reporter_name = Column(String(120), nullable=False) 
+    incident_type = Column(String(40), nullable=False)  
+    description = Column(Text, nullable=False)
+    photo_data = Column(Text, nullable=True)            
+
+    # Workflow
+    status = Column(String(20), nullable=False, default="submitted")  
+    resolution_notes = Column(Text, nullable=True)
+    resolved_by = Column(String(120), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Abuse-prevention metadata
+    reporter_ip = Column(String(64), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
+class Anomaly(Base):
+    __tablename__ = "anomalies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("parking_sessions.id"), nullable=True)
+
+    plate_number = Column(String(20), nullable=False, index=True)
+    anomaly_type = Column(String(50), nullable=False)    
+    severity = Column(String(20), nullable=False, default="medium")  
+    status = Column(String(20), nullable=False, default="flagged")   
+
+    details = Column(Text, nullable=True)                 
+    detected_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    resolved_by = Column(String(120), nullable=True)      
+    resolved_at = Column(DateTime, nullable=True)
+    resolution_notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class OccupancyLog(Base):
+    __tablename__ = "occupancy_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    # Per-type snapshot
+    motor_occupied = Column(Integer, nullable=False, default=0)
+    motor_capacity = Column(Integer, nullable=False, default=0)
+
+    four_wheel_occupied = Column(Integer, nullable=False, default=0)
+    four_wheel_capacity = Column(Integer, nullable=False, default=0)
+
+    total_occupied = Column(Integer, nullable=False, default=0)
+    total_capacity = Column(Integer, nullable=False, default=0)
+
+    is_full = Column(Boolean, nullable=False, default=False)
+
+    # "periodic" | "entry" | "exit" | "status_change"
+    trigger = Column(String(20), nullable=False, default="periodic")

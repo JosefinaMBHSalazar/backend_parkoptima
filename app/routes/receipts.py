@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session as DBSession
 
 from ..database import get_db
 from ..models import ParkingSession, WalletBalance, User, Vehicle
+from ..services import get_or_create_settings
 
 import pytz
 
@@ -57,6 +58,10 @@ def get_session_receipt(session_id: int, db: DBSession = Depends(get_db)):
     wallet_plate = _resolve_owner_plate(db, session.plate_number)
     method = (session.payment_method or "").lower()
 
+    # A "reentered" session carries no payment of its own — the plate paid
+    # earlier today. Surface that clearly on the receipt.
+    is_reentry = method == "reentered"
+
     # ── Balance AFTER the transaction — from the snapshot ONLY ──
     if session.balance_after is not None:
         balance_after = float(session.balance_after)
@@ -75,6 +80,23 @@ def get_session_receipt(session_id: int, db: DBSession = Depends(get_db)):
         # Cash never changes the wallet — before == after
         balance_before = balance_after
 
+    try:
+        settings = get_or_create_settings(db)
+        receipt_branding = {
+            "facility_name": (settings.receipt_facility_name or "").strip() or "ParkOptima",
+            "header":        (settings.receipt_header or "").strip()        or "Parking Receipt",
+            "footer":        (settings.receipt_footer or "").strip()        or "Thank you for parking with us.",
+            "notes":         (settings.receipt_notes or "").strip()         or "",
+        }
+    except Exception:
+        # Never let a settings failure break the receipt
+        receipt_branding = {
+            "facility_name": "ParkOptima",
+            "header": "Parking Receipt",
+            "footer": "Thank you for parking with us.",
+            "notes": "",
+        }
+
     return {
         "receipt_number": f"RCPT-{session.id:06d}",
         "session_id": session.id,
@@ -83,11 +105,20 @@ def get_session_receipt(session_id: int, db: DBSession = Depends(get_db)):
         "entry_time": _to_manila_iso(session.entry_time),
         "exit_time": _to_manila_iso(session.exit_time),
         "fee": fee,
-        "payment_method": session.payment_method or "unpaid",
+        "payment_method": (
+            "reentered" if is_reentry
+            else (session.payment_method or "unpaid")
+        ),
+        "payment_label": (
+            "Re-entered (covered by earlier payment today)" if is_reentry
+            else (session.payment_method.upper() if session.payment_method else "UNPAID")
+        ),
         "status": session.status,
         "balance_before": balance_before,
         "balance_after": balance_after,
         "current_balance": balance_after,
         "wallet_plate": wallet_plate,
         "issued_at": _to_manila_iso(session.exit_time),
+        # ── Receipt content ──
+        "receipt_branding": receipt_branding,
     }

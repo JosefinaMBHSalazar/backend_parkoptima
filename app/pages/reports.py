@@ -5,8 +5,14 @@ from ..models import ParkingSession
 
 def get_reports_data(db: Session) -> Dict[str, object]:
     sessions = db.query(ParkingSession).all()
-    paid = [session for session in sessions if session.payment_method]
-    unpaid = [session for session in sessions if not session.payment_method]
+    paid = [
+        session for session in sessions
+        if session.payment_method and session.payment_method != "reentered"
+    ]
+    unpaid = [
+        session for session in sessions
+        if not session.payment_method
+    ]
     return {
         "total_sessions": len(sessions),
         "paid_sessions": len(paid),

@@ -61,7 +61,7 @@ def _hourly_values(sessions: Iterable[ParkingSession], days: int = 14) -> Dict[d
         key = entry.replace(minute=0, second=0, microsecond=0, tzinfo=None)
         target = all_values if entry.replace(tzinfo=None) < cutoff else values
         target[key]["occupancy"] += 1
-        if session.payment_method:
+        if session.payment_method and session.payment_method != "reentered":
             target[key]["revenue"] += float(session.fee or 0.0)
     return values or all_values
 
@@ -70,7 +70,10 @@ def _hourly_values(sessions: Iterable[ParkingSession], days: int = 14) -> Dict[d
 
 def build_natural_language_summary(db: Session) -> Dict[str, Any]:
     sessions = db.query(ParkingSession).all()
-    paid = [session for session in sessions if session.payment_method]
+    paid = [
+        session for session in sessions
+        if session.payment_method and session.payment_method != "reentered"
+    ]
     revenue = sum(float(session.fee or 0.0) for session in paid)
     parked = sum(session.status == "parked" for session in sessions)
     completed = sum(session.status == "completed" for session in sessions)

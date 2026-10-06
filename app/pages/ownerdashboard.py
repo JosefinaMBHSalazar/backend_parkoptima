@@ -9,8 +9,16 @@ from ..analytics_engine import _hourly_values
 
 def get_owner_dashboard_data(db: Session) -> Dict[str, object]:
     sessions = db.query(ParkingSession).order_by(ParkingSession.entry_time.desc()).all()
-    paid_sessions = [session for session in sessions if session.payment_method]
-    unpaid_sessions = [session for session in sessions if not session.payment_method]
+    paid_sessions = [
+        session for session in sessions
+        if session.payment_method and session.payment_method != "reentered"
+    ]
+    # "reentered" sessions are not unpaid either — they're a separate state.
+    # Exclude them from both paid and unpaid counts so totals reconcile.
+    unpaid_sessions = [
+        session for session in sessions
+        if not session.payment_method
+    ]
     revenue = round(sum(float(session.fee or 0.0) for session in paid_sessions), 2)
 
     hourly_raw = _hourly_values(sessions, days=14)

@@ -9,7 +9,9 @@ from collections import defaultdict
 
 from sqlalchemy.orm import Session
 
-from .models import OwnerProfile, ParkingSession, SystemSettings, User, VehicleRegistration
+from .models import OccupancyLog, OwnerProfile, ParkingSession, SystemSettings, User, VehicleRegistration
+
+from datetime import datetime, time as dt_time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -62,7 +64,16 @@ def get_or_create_settings(db: Session) -> SystemSettings:
             system_name="ParkOptima",
             motor_fee=5.0,
             four_wheel_fee=20.0,
+            motorcycle_capacity=90,
+            four_wheel_capacity=10,
             parking_capacity=100,
+            operating_open_minutes=420,
+            operating_close_minutes=1020,
+            # ── Receipt content
+            receipt_facility_name="",
+            receipt_header="",
+            receipt_footer="",
+            receipt_notes="",
         )
         db.add(settings)
         try:
@@ -76,6 +87,125 @@ def get_or_create_settings(db: Session) -> SystemSettings:
     else:
         logger.info(f"📊 Retrieved settings with parking_capacity: {settings.parking_capacity}")
     return settings
+
+
+def get_operating_hours(settings: SystemSettings) -> tuple[dt_time, dt_time]:
+    """Return the (open, close) times as naive ``datetime.time`` in Asia/Manila.
+
+    Values are stored as minutes-since-midnight; invalid / missing values
+    fall back to 07:00–17:00.
+    """
+    try:
+        open_min = int(settings.operating_open_minutes)
+    except Exception:
+        open_min = 420
+    try:
+        close_min = int(settings.operating_close_minutes)
+    except Exception:
+        close_min = 1020
+
+    # Clamp to [0, 1439]
+    open_min = max(0, min(open_min, 1439))
+    close_min = max(0, min(close_min, 1439))
+
+    open_time = dt_time(hour=open_min // 60, minute=open_min % 60)
+    close_time = dt_time(hour=close_min // 60, minute=close_min % 60)
+    return open_time, close_time
+
+
+def is_within_operating_hours(settings: SystemSettings, now_manila: Optional[datetime] = None) -> tuple[bool, str]:
+    """Return (is_open, human_message).
+
+    If ``now_manila`` is not supplied, uses the current time in Asia/Manila.
+    """
+    import pytz
+    manila = pytz.timezone("Asia/Manila")
+
+    if now_manila is None:
+        now_manila = datetime.now(manila)
+    elif now_manila.tzinfo is None:
+        now_manila = manila.localize(now_manila)
+    else:
+        now_manila = now_manila.astimezone(manila)
+
+    open_time, close_time = get_operating_hours(settings)
+    now_t = now_manila.time()
+
+    # Simple same-day window (open < close). Overnight windows are not
+    # currently supported — if close <= open, treat as always open to
+    # avoid locking the facility out.
+    if close_time <= open_time:
+        return True, ""
+
+    is_open = open_time <= now_t < close_time
+    if is_open:
+        return True, ""
+
+    # Friendly label
+    def fmt(t: dt_time) -> str:
+        h = t.hour
+        m = t.minute
+        suffix = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m:02d} {suffix}"
+
+    return False, f"Facility is closed. Operating hours: {fmt(open_time)} – {fmt(close_time)} (Asia/Manila)."
+
+
+def snapshot_occupancy(db: Session, trigger: str = "periodic") -> Optional[OccupancyLog]:
+    """Take a snapshot of current occupancy and save it to occupancy_logs.
+
+    Safe to call frequently — the caller decides the cadence.
+    Never raises: a snapshot failure must not break the request that
+    triggered it. Returns the created row (or None on failure).
+    """
+    try:
+        settings = db.query(SystemSettings).first()
+
+        motor_cap = int(getattr(settings, "motorcycle_capacity", 90) or 0)
+        four_cap = int(getattr(settings, "four_wheel_capacity", 10) or 0)
+        total_cap = motor_cap + four_cap
+
+        parked = db.query(ParkingSession).filter(
+            ParkingSession.status == "parked"
+        ).all()
+
+        motor_occ = sum(1 for s in parked if s.vehicle_type == "motor")
+        four_occ = sum(
+            1 for s in parked
+            if s.vehicle_type in ("4wheels", "4_wheels", "four_wheel", "4 Wheels")
+        )
+        total_occ = motor_occ + four_occ
+
+        is_full = (
+            (motor_cap > 0 and motor_occ >= motor_cap) and
+            (four_cap > 0 and four_occ >= four_cap)
+        ) or (total_cap > 0 and total_occ >= total_cap)
+
+        row = OccupancyLog(
+            timestamp=datetime.utcnow(),
+            motor_occupied=motor_occ,
+            motor_capacity=motor_cap,
+            four_wheel_occupied=four_occ,
+            four_wheel_capacity=four_cap,
+            total_occupied=total_occ,
+            total_capacity=total_cap,
+            is_full=is_full,
+            trigger=trigger,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        logger.info(
+            f"📸 Occupancy snapshot [{trigger}]: "
+            f"motor={motor_occ}/{motor_cap}, four={four_occ}/{four_cap}, "
+            f"total={total_occ}/{total_cap}"
+        )
+        return row
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"Occupancy snapshot failed: {e}")
+        return None
 
 
 def get_or_create_owner_profile(db: Session) -> OwnerProfile:
@@ -705,7 +835,13 @@ def analyze_scan_image(image_base64: str, db: Optional[Session] = None) -> Tuple
     return best_plate, round(conf_val, 3), vehicle_type
 
 
-def create_session_from_scan(db: Session, plate_number: str, vehicle_type: str, settings: SystemSettings) -> ParkingSession:
+def create_session_from_scan(
+    db: Session,
+    plate_number: str,
+    vehicle_type: str,
+    settings: SystemSettings,
+    owner_name: Optional[str] = None,
+) -> ParkingSession:
     logger.info(f"Creating parking session for plate: {plate_number}, type: {vehicle_type}")
     session = ParkingSession(
         plate_number=plate_number.upper(),
@@ -713,7 +849,7 @@ def create_session_from_scan(db: Session, plate_number: str, vehicle_type: str, 
         fee=estimate_fee(vehicle_type, settings),
         status="parked",
         payment_method=None,
-        slot="A1",
+        owner_name=owner_name,
     )
     db.add(session)
     db.commit()

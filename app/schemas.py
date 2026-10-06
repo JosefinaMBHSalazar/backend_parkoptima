@@ -26,7 +26,16 @@ class SystemSettingsBase(BaseModel):
     system_name: str = "ParkOptima"
     motor_fee: float = 5.0
     four_wheel_fee: float = 20.0
-    parking_capacity: int = 100
+    motorcycle_capacity: int = 90
+    four_wheel_capacity: int = 10
+    parking_capacity: Optional[int] = None
+    operating_open_minutes: int = 420
+    operating_close_minutes: int = 1020
+    # ── Receipt content ──
+    receipt_facility_name: Optional[str] = ""
+    receipt_header:        Optional[str] = ""
+    receipt_footer:        Optional[str] = ""
+    receipt_notes:         Optional[str] = ""
 
 class SystemSettingsResponse(SystemSettingsBase):
     id: int
@@ -46,6 +55,7 @@ class ParkingSessionBase(BaseModel):
     plate_type: str = "registered"          
     entry_method: str = "scan"              
     created_by: Optional[str] = None
+    owner_name: Optional[str] = None
 
 
 class ParkingSessionUpdate(BaseModel):
@@ -289,3 +299,86 @@ class PasswordChangeResponse(BaseModel):
     """Response schema for password change."""
     message: str
     user_id: int
+
+
+# ── Incident Reports ──────────────────────────────────────────
+
+class IncidentVerifyRequest(BaseModel):
+    plate_number: str
+    reporter_name: str
+
+
+class IncidentVerifyResponse(BaseModel):
+    ok: bool
+    detail: Optional[str] = None
+    session_id: Optional[int] = None
+    plate_number: Optional[str] = None
+    owner_name: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    entry_time: Optional[datetime] = None
+
+
+class IncidentCreateRequest(BaseModel):
+    plate_number: str
+    reporter_name: str
+    incident_type: str
+    description: str
+    photo_data: Optional[str] = None       
+
+
+class IncidentReportResponse(BaseModel):
+    id: int
+    reference_number: str
+    session_id: Optional[int] = None
+    plate_number: str
+    owner_name: Optional[str] = None
+    reporter_name: str
+    incident_type: str
+    description: str
+    photo_data: Optional[str] = None
+    status: str
+    resolution_notes: Optional[str] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class IncidentStatusUpdate(BaseModel):
+    status: str
+    resolution_notes: Optional[str] = None
+    resolved_by: Optional[str] = None
+    actor_role:  Optional[str] = None
+    actor_email: Optional[str] = None
+    actor_name:  Optional[str] = None
+
+
+class AnomalyResponse(BaseModel):
+    id: int
+    session_id: Optional[int] = None
+    plate_number: str
+    anomaly_type: str
+    severity: str
+    status: str
+    details: Optional[str] = None
+    detected_at: datetime
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolution_notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AnomalyResolveRequest(BaseModel):
+    action: str                       
+    resolution_notes: Optional[str] = None
+
+    actor_role:  Optional[str] = None
+    actor_email: Optional[str] = None
+    actor_name:  Optional[str] = None
