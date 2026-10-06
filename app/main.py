@@ -273,8 +273,11 @@ def migrate_database():
 
             if 'receipt_notes' not in columns:
                 logger.info("Adding 'receipt_notes' to system_settings...")
+                # NOTE: MySQL/MariaDB reject DEFAULT on TEXT/BLOB/JSON columns.
+                # The application already treats NULL as "" everywhere it reads
+                # receipt_notes, so a plain nullable TEXT column is fine.
                 conn.execute(text(
-                    "ALTER TABLE system_settings ADD COLUMN receipt_notes TEXT DEFAULT ''"
+                    "ALTER TABLE system_settings ADD COLUMN receipt_notes TEXT NULL"
                 ))
                 conn.commit()
                 logger.info("✅ Added receipt_notes")
