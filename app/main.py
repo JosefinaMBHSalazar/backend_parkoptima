@@ -1628,31 +1628,51 @@ def api_update_session(
             "exit_time": session.exit_time.isoformat() if session.exit_time else None,
         }
 
-        changes = []
-        for key in before:
-            if before[key] != after[key]:
-                label = key.replace('_', ' ')
-                changes.append(f"{label}: {before[key]!r} → {after[key]!r}")
-
-        detail = (
-            f"Session #{session.id} ({session.plate_number}) edited — "
-            + ("; ".join(changes) if changes else "no fields changed")
+        # ── Detect whether this PUT is actually an exit, not an edit. ──
+        # The exit flow (ScanVehicle's handleConfirmExit) PUTs the same
+        # endpoint that the Transaction Log's "Edit" button PUTs. On exit
+        # it sets status='completed' and populates exit_time for the first
+        # time. The frontend already writes its own "Exit - ..." audit row,
+        # so writing "Edited Transaction" here produces a duplicate with the
+        # wrong label. Skip it in that specific case.
+        is_exit_transition = (
+            before["status"] == "parked"
+            and after["status"] == "completed"
+            and before["exit_time"] is None
+            and after["exit_time"] is not None
         )
 
-        # Attribute the audit row to the actual actor.
-        create_audit_log(
-            db,
-            user_id=None,
-            user_email=actor_email,
-            user_role=(actor_role or "attendant").lower(),
-            action_type="Edited Transaction",
-            reference_id=str(session.id),
-            details=(
-                f"[{actor_name or actor_email or 'unknown'}] {detail}"
-                if (actor_name or actor_email)
-                else detail
-            ),
-        )
+        if is_exit_transition:
+            logger.info(
+                f"Skipping generic 'Edited Transaction' audit for session "
+                f"#{session.id} — this is an exit; the frontend logs the "
+                f"correct 'Exit - ...' row."
+            )
+        else:
+            changes = []
+            for key in before:
+                if before[key] != after[key]:
+                    label = key.replace('_', ' ')
+                    changes.append(f"{label}: {before[key]!r} → {after[key]!r}")
+
+            detail = (
+                f"Session #{session.id} ({session.plate_number}) edited — "
+                + ("; ".join(changes) if changes else "no fields changed")
+            )
+
+            create_audit_log(
+                db,
+                user_id=None,
+                user_email=actor_email,
+                user_role=(actor_role or "attendant").lower(),
+                action_type="Edited Transaction",
+                reference_id=str(session.id),
+                details=(
+                    f"[{actor_name or actor_email or 'unknown'}] {detail}"
+                    if (actor_name or actor_email)
+                    else detail
+                ),
+            )
     except Exception as e:
         logger.warning(f"Could not write Edited Transaction audit log: {e}")
 
