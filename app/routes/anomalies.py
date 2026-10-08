@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import pytz
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
 from ..database import get_db
@@ -33,9 +34,16 @@ def _upsert_anomaly(
     severity: str,
     details: str,
 ) -> Optional[Anomaly]:
-    """Insert a flagged anomaly if one doesn't already exist for this
-    (session_id, anomaly_type) pair. Returns the row, or None if it
-    already existed."""
+    """Return the existing row for (plate, type, session_id) if one
+    exists — regardless of status — otherwise insert a new one.
+
+    Idempotent by design: the *existence* of a row for this key is
+    what suppresses insertion, not its status. The previous version
+    only suppressed inserts when the existing row was still 'flagged',
+    so any dismissed/verified row caused a fresh insert on the next
+    detection pass — which is what produced thousands of duplicate
+    long_stay rows.
+    """
     q = db.query(Anomaly).filter(
         Anomaly.plate_number == plate_number,
         Anomaly.anomaly_type == anomaly_type,
@@ -43,9 +51,20 @@ def _upsert_anomaly(
     if session_id is not None:
         q = q.filter(Anomaly.session_id == session_id)
 
-    existing = q.first()
-    if existing and existing.status == "flagged":
-        return None  # already flagged — don't duplicate
+    # Deterministic: always consider the most recent row for this key.
+    existing = q.order_by(Anomaly.id.desc()).first()
+
+    if existing is not None:
+        # Row already exists for this key. Do NOT insert. If it's still
+        # flagged, just bump detected_at so the UI shows fresh activity.
+        if existing.status == "flagged":
+            existing.detected_at = datetime.utcnow()
+            existing.severity = severity
+            existing.details = details
+            db.add(existing)
+            db.commit()
+            db.refresh(existing)
+        return None
 
     row = Anomaly(
         session_id=session_id,
@@ -57,9 +76,16 @@ def _upsert_anomaly(
         detected_at=datetime.utcnow(),
     )
     db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    try:
+        db.commit()
+        db.refresh(row)
+        return row
+    except IntegrityError:
+        # A concurrent request inserted the same (session_id,
+        # anomaly_type) between our SELECT and our INSERT. Roll back
+        # and return None so the caller treats it as "already exists".
+        db.rollback()
+        return None
 
 
 def run_detection(db: DBSession) -> List[Anomaly]:
@@ -165,14 +191,13 @@ def list_anomalies(
     plate: Optional[str] = None,
     db: DBSession = Depends(get_db),
 ):
-    """List anomalies. Also runs detection first so the list is always
-    current — cheap because `_upsert_anomaly` is idempotent."""
-    try:
-        run_detection(db)
-    except Exception:
-        # Never let a detection failure block the read
-        db.rollback()
+    """Read-only list of anomalies.
 
+    Detection is *not* run here — that's the job of /scan (called by
+    the owner dashboard on its own cadence) and the periodic task.
+    Running detection on every read caused the Live Monitor's 8 s
+    verifyPoll to insert a new row per active overstay every tick.
+    """
     q = db.query(Anomaly)
     if status and status != "all":
         q = q.filter(Anomaly.status == status)

@@ -143,6 +143,49 @@ def migrate_database():
             logger.info("✅ 'email' column already exists in vehicle_accounts")
     except Exception as e:
         logger.warning(f"Could not verify vehicle_accounts table: {e}")
+
+    # ── anomalies: unique index on (session_id, anomaly_type) ──
+    try:
+        inspector = inspect(engine)
+        if 'anomalies' in inspector.get_table_names():
+            existing_indexes = {ix['name'] for ix in inspector.get_indexes('anomalies')}
+            if 'uq_anomaly_session_type' not in existing_indexes:
+                logger.info("Creating unique index uq_anomaly_session_type on anomalies…")
+                with engine.connect() as conn:
+                    # ── Collapse ALL duplicates for the key, regardless
+                    # of status. The unique index applies to every row,
+                    # so we must delete the extras — dismissing them
+                    # isn't enough because a dismissed row still occupies
+                    # the key.
+                    #
+                    # Strategy: keep the most recent row per key (highest
+                    # id), delete the rest. Rows with session_id IS NULL
+                    # are excluded — MariaDB treats NULLs as distinct in
+                    # unique indexes, so they don't collide.
+                    deleted = conn.execute(text("""
+                        DELETE a FROM anomalies a
+                        JOIN (
+                            SELECT session_id, anomaly_type, MAX(id) AS keep_id
+                            FROM anomalies
+                            WHERE session_id IS NOT NULL
+                            GROUP BY session_id, anomaly_type
+                        ) k
+                          ON a.session_id    = k.session_id
+                         AND a.anomaly_type  = k.anomaly_type
+                        WHERE a.id <> k.keep_id
+                    """))
+                    logger.info(f"🗑  Deleted {deleted.rowcount} duplicate anomaly rows")
+
+                    conn.execute(text("""
+                        CREATE UNIQUE INDEX uq_anomaly_session_type
+                        ON anomalies (session_id, anomaly_type)
+                    """))
+                    conn.commit()
+                logger.info("✅ Created unique index uq_anomaly_session_type")
+            else:
+                logger.info("✅ uq_anomaly_session_type already exists")
+    except Exception as e:
+        logger.warning(f"Could not create uq_anomaly_session_type: {e}")
     
     # Check if vehicles table exists - if not, create it
     try:

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Integer, String, DateTime, Float, Text, Boolean
+from sqlalchemy import Column, ForeignKey, Integer, String, DateTime, Float, Text, Boolean, UniqueConstraint
 from sqlalchemy.sql import func
 from datetime import datetime  
 from .database import Base
@@ -233,6 +233,21 @@ class Anomaly(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+    __table_args__ = (
+        # One row per (session_id, anomaly_type). NULL session_id is
+        # intentionally allowed to repeat — MySQL/MariaDB treat NULLs as
+        # distinct in unique indexes, which is exactly right: anomalies
+        # not tied to a session (e.g. facility_full) can repeat, but a
+        # real session can only have one long_stay, one unpaid_exit, etc.
+        # This is what stops concurrent detection passes from inserting
+        # N copies of the same row.
+        UniqueConstraint(
+            "session_id", "anomaly_type",
+            name="uq_anomaly_session_type",
+        ),
+    )
 
 
 class OccupancyLog(Base):
